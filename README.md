@@ -13,13 +13,20 @@ The BraTS 2024 challenge uses **lesion-wise Dice**, not voxel-wise Dice. Key dif
 
 ## Setup
 
-```bash
-pip install connected-components-3d nibabel scipy numpy
-```
+### FarmShare
 
-On FarmShare:
+`nibabel`, `scipy`, and `numpy` are already installed system-wide. You only need one extra package:
+
 ```bash
 python3 -m pip install --user --break-system-packages connected-components-3d
+```
+
+That's it. No venv needed.
+
+### Other environments
+
+```bash
+pip install connected-components-3d nibabel scipy numpy
 ```
 
 ## Usage
