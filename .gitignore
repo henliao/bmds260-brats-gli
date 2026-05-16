@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.nii.gz
+*.json
+!dataset.json
+.DS_Store
