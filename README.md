@@ -1,6 +1,11 @@
-# BraTS-GLI 2024 Evaluation Tools
+# BraTS-GLI 2024 Tools
 
-Lesion-wise Dice evaluation for the [BraTS 2024 Post-Treatment Glioma Segmentation Challenge](https://www.synapse.org/Synapse:syn53708249), reimplemented from the [official metrics](https://github.com/rachitsaluja/BraTS-2024-Metrics).
+Shared tooling for the [BraTS 2024 Post-Treatment Glioma Segmentation Challenge](https://www.synapse.org/Synapse:syn53708249):
+
+- **eval_lesion_dice.py** -- Official lesion-wise Dice evaluation, reimplemented from the [challenge metrics](https://github.com/rachitsaluja/BraTS-2024-Metrics)
+- **setup_brats_nnunet.sh** -- Convert BraTS-GLI data to nnU-Net v1 format (symlinks)
+- **train_mednext_v2.slurm** -- SLURM script for MedNeXt-B (kernel 5x5x5) training on FarmShare
+- **prep_holdout.sh** -- Prepare holdout test set for inference and evaluation
 
 ## What this computes
 
@@ -166,3 +171,60 @@ The BraTS 2024 challenge leaderboard reports lesion-wise Dice. Published benchma
 | 2025 Winner | 0.749 | 0.825 | 0.790 | 0.872 | On-the-fly GAN augmentation |
 
 Note: these are test set scores. Validation fold scores are typically similar but not directly comparable.
+
+## Training scripts
+
+### Data setup
+
+Convert BraTS-GLI format to nnU-Net v1 format using symlinks (saves ~35 GB):
+
+```bash
+# Default: Task500, uses ~/bmds260/data/BraTS-GLI/training_data1_v2
+bash setup_brats_nnunet.sh
+
+# Custom task ID and data directory
+bash setup_brats_nnunet.sh 501 /scratch/users/abieleck/brats_2024/train_val_set
+```
+
+This creates `imagesTr/` and `labelsTr/` directories with symlinks, generates `dataset.json`, and saves an ID mapping JSON.
+
+### Training (MedNeXt-B, FarmShare)
+
+```bash
+# Single fold
+sbatch train_mednext_v2.slurm 0
+
+# All 5 folds
+for f in 0 1 2 3 4; do sbatch train_mednext_v2.slurm $f; done
+```
+
+Requires: `pip install --user --break-system-packages nnunet-mednext`
+
+### Holdout test set
+
+Prepare the holdout set for inference after training completes:
+
+```bash
+bash prep_holdout.sh 501 ~/bmds260/holdout_test_set
+```
+
+Then run inference and evaluate:
+
+```bash
+# Inference (ensemble all 5 folds)
+export nnUNet_raw_data_base=~/bmds260/nnunet/raw_data_base
+export nnUNet_preprocessed=~/bmds260/nnunet/preprocessed
+export RESULTS_FOLDER=~/bmds260/nnunet/results
+
+nnUNetv2_predict \
+  -i $nnUNet_raw_data_base/nnUNet_raw_data/Task501_BraTSGLI_v2/imagesTs \
+  -o ~/bmds260/holdout_predictions \
+  -tr nnUNetTrainerV2_MedNeXt_B_kernel5 \
+  -t 501 -m 3d_fullres -f 0 1 2 3 4
+
+# Evaluate
+python3 eval_lesion_dice.py \
+  --pred-dir ~/bmds260/holdout_predictions \
+  --gt-dir ~/bmds260/holdout_gt \
+  -o holdout_lesion_dice.json
+```
