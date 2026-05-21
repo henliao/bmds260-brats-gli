@@ -54,7 +54,7 @@ fi
 # Step 2: Train MedNeXt-B with 5x5x5 kernels
 echo ""
 echo "=== Step 2: Training MedNeXt-B k5, Fold $FOLD ==="
-mednextv1_train 3d_fullres nnUNetTrainerV2_MedNeXt_B_kernel5 Task501_BraTSGLI_v2 $FOLD
+mednextv1_train 3d_fullres nnUNetTrainerV2_MedNeXt_B_kernel5 Task501_BraTSGLI_v2 $FOLD -c
 
 echo ""
 echo "=== Training Complete ==="
