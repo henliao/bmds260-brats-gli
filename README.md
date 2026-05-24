@@ -281,6 +281,29 @@ for f in 0 1 2 3 4; do sbatch train_mednext_v2.slurm $f; done
 
 Requires: `pip install --user --break-system-packages nnunet-mednext`
 
+### Monitoring training
+
+The CurriculumGAN SLURM script streams the nnU-Net training log to stdout in real time. Monitor a running job with:
+
+```bash
+# tail the SLURM output (includes epoch, loss, curriculum phase transitions)
+tail -f ~/bmds260/logs/curgan_<JOBID>_<FOLD>.out
+
+# check all folds at once
+for f in ~/bmds260/logs/curgan_*_*.out; do
+  echo "--- $f ---"
+  tail -3 "$f"
+  echo
+done
+```
+
+For baseline (non-GAN) training, the training log is in the nnU-Net results directory:
+
+```bash
+tail -f ~/bmds260/nnunet/results/nnUNet/3d_fullres/Task501_BraTSGLI_v2/\
+  nnUNetTrainerV2_MedNeXt_B_kernel5__nnUNetPlansv2.1/fold_<N>/training_log_*.txt
+```
+
 ### Holdout test set
 
 Prepare the holdout set for inference after training completes:
