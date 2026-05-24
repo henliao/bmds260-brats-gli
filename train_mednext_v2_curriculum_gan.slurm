@@ -4,7 +4,7 @@
 #SBATCH --qos=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=192G
+#SBATCH --mem=80G
 #SBATCH --time=48:00:00
 #SBATCH --output=/home/users/hankliao/bmds260/logs/curgan_%A_%a.out
 
