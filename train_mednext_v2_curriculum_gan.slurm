@@ -41,10 +41,24 @@ echo ""
 echo "=== Step 2: Training MedNeXt-B k5 CurriculumGAN, Fold $FOLD ==="
 
 # Check if there's a checkpoint to resume from
+# SAFETY: Never overwrite existing checkpoints. Always use -c if checkpoint exists.
 RESULT_DIR="$RESULTS_FOLDER/nnUNet/3d_fullres/Task501_BraTSGLI_v2/nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN__nnUNetPlansv2.1/fold_$FOLD"
-if [ -f "$RESULT_DIR/model_latest.model" ]; then
-    echo "Resuming from checkpoint (fold $FOLD)"
-    RESUME_FLAG="-c"
+if [ -f "$RESULT_DIR/model_latest.model" ] && [ -f "$RESULT_DIR/model_latest.model.pkl" ]; then
+    # Verify checkpoint pkl is non-trivial (> 1KB)
+    PKL_SIZE=$(stat -c%s "$RESULT_DIR/model_latest.model.pkl" 2>/dev/null || echo 0)
+    if [ "$PKL_SIZE" -gt 1000 ]; then
+        echo "Resuming from checkpoint (fold $FOLD, pkl size: ${PKL_SIZE} bytes)"
+        RESUME_FLAG="-c"
+    else
+        echo "ERROR: Checkpoint appears corrupted (pkl size: ${PKL_SIZE}). Refusing to start."
+        echo "Manually inspect: $RESULT_DIR/"
+        exit 1
+    fi
+elif [ -d "$RESULT_DIR" ] && [ "$(ls -A "$RESULT_DIR" 2>/dev/null)" ]; then
+    echo "WARNING: Result dir exists but no valid checkpoint found!"
+    echo "Contents: $(ls "$RESULT_DIR")"
+    echo "SAFETY: Refusing to overwrite. To start fresh, remove: $RESULT_DIR"
+    exit 1
 else
     echo "Starting fresh training (fold $FOLD)"
     RESUME_FLAG=""
