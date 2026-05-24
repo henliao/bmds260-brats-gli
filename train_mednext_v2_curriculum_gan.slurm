@@ -64,14 +64,41 @@ else
     RESUME_FLAG=""
 fi
 
+# Stream nnU-Net's training log to SLURM stdout for real-time monitoring.
+# The log file is created after training starts, so we wait for it.
+TRAIN_LOG_DIR="$RESULT_DIR"
+(
+    # Wait up to 5 min for the training log to appear
+    for i in $(seq 1 300); do
+        LOG_FILE=$(ls -t "$TRAIN_LOG_DIR"/training_log_*.txt 2>/dev/null | head -1)
+        if [ -n "$LOG_FILE" ]; then
+            echo "[monitor] Streaming: $LOG_FILE"
+            tail -f "$LOG_FILE" &
+            TAIL_PID=$!
+            echo $TAIL_PID > /tmp/curgan_tail_${SLURM_JOB_ID}.pid
+            wait $TAIL_PID
+            break
+        fi
+        sleep 1
+    done
+) &
+MONITOR_PID=$!
+
 mednextv1_train 3d_fullres \
     nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN \
     Task501_BraTSGLI_v2 \
     $FOLD \
     $RESUME_FLAG
+TRAIN_EXIT=$?
+
+# Stop the log streamer
+kill $MONITOR_PID 2>/dev/null
+TAIL_PID=$(cat /tmp/curgan_tail_${SLURM_JOB_ID}.pid 2>/dev/null)
+kill $TAIL_PID 2>/dev/null
+rm -f /tmp/curgan_tail_${SLURM_JOB_ID}.pid
 
 echo ""
-echo "=== Training Complete ==="
+echo "=== Training Complete (exit code: $TRAIN_EXIT) ==="
 echo "End: $(date)"
 
 # Run validation predictions
