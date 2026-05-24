@@ -55,15 +55,6 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
         # Weights directory
         self.gligan_weights_dir = os.environ.get("GLIGAN_WEIGHTS_DIR", DEFAULT_WEIGHTS_DIR)
 
-        # Round-robin support: stop at a specific epoch for fold rotation.
-        # Set CURGAN_STOP_EPOCH env var to pause training at that epoch.
-        # The trainer exits cleanly, preserving model_latest for resume.
-        # When not set, trains to 1000 as normal (fully compatible with
-        # single-fold sbatch using train_mednext_v2_curriculum_gan.slurm).
-        stop_epoch_str = os.environ.get("CURGAN_STOP_EPOCH", "")
-        self._stop_epoch = int(stop_epoch_str) if stop_epoch_str.isdigit() else None
-        self._is_early_stop = False  # set True when pausing at phase boundary
-
     def _get_gligan(self):
         """Lazy-load GliGAN augmenter on first use."""
         if self._gligan is not None:
@@ -182,7 +173,7 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
         return l.detach().cpu().numpy()
 
     def on_epoch_end(self):
-        """Log curriculum phase transitions. Support clean pause for round-robin."""
+        """Log curriculum phase transitions."""
         ret = super().on_epoch_end()
 
         # Log phase transitions
@@ -195,45 +186,4 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
                 f"=== CURRICULUM: Entering Phase 3 (epoch {self.epoch}). "
                 f"GAN injection at {self.gan_prob_phase3*100:.0f}% ===")
 
-        # Round-robin: stop cleanly at target epoch.
-        # model_latest is already saved by super().on_epoch_end().
-        if self._stop_epoch is not None and self.epoch >= self._stop_epoch:
-            self.print_to_log_file(
-                f"=== ROUND-ROBIN: Pausing at epoch {self.epoch} "
-                f"(stop_epoch={self._stop_epoch}) ===")
-            self._is_early_stop = True
-            return False
-
         return ret
-
-    def run_training(self):
-        """
-        Override to preserve model_latest when pausing for round-robin.
-
-        nnU-Net's post-loop cleanup: epoch -= 1, write model_final_checkpoint,
-        delete model_latest. When stopping early via CURGAN_STOP_EPOCH,
-        on_epoch_end returns False and sets _is_early_stop. After the parent
-        finishes (including its post-loop cleanup which deletes model_latest),
-        we re-save the checkpoint so model_latest exists for resume.
-
-        When CURGAN_STOP_EPOCH is not set, this behaves identically to the
-        parent: full training to 1000, final checkpoint, normal cleanup.
-        """
-        super().run_training()
-
-        if self._is_early_stop:
-            # Parent deleted model_latest and possibly wrote model_final.
-            # Re-save model_latest so resume works, and remove the premature
-            # model_final_checkpoint (it's not actually final).
-            import os
-            from batchgenerators.utilities.file_and_folder_operations import join, isfile
-            self.epoch += 1  # undo the epoch -= 1 from parent post-loop
-            self.save_checkpoint(join(self.output_folder, "model_latest.model"))
-            # Remove premature model_final_checkpoint if it was written
-            final_path = join(self.output_folder, "model_final_checkpoint.model")
-            if isfile(final_path):
-                os.remove(final_path)
-                os.remove(final_path + ".pkl")
-            self.print_to_log_file(
-                f"Round-robin pause complete. model_latest restored at epoch {self.epoch}. "
-                f"Resume with -c flag.")
