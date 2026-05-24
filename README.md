@@ -161,16 +161,97 @@ Labels where both GT and prediction are empty are marked `"absent"` and excluded
 | 3 | ET | Enhancing tumor |
 | 4 | RC | Resection cavity |
 
-## Comparison with challenge results
+## Results
 
-The BraTS 2024 challenge leaderboard reports lesion-wise Dice. Published benchmarks:
+### Lesion-wise Dice (cross-validation, 5-fold, 292 cases per fold)
 
-| Team | NETC | SNFH | ET | RC | Method |
-|------|------|------|----|----|--------|
-| 2024 Winner | 0.808 | 0.893 | 0.790 | 0.776 | 6-model ensemble + GAN augmentation |
-| 2025 Winner | 0.749 | 0.825 | 0.790 | 0.872 | On-the-fly GAN augmentation |
+**Baseline: MedNeXt-B kernel 5x5x5** (1000 epochs, Task501, 1459 training cases)
 
-Note: these are test set scores. Validation fold scores are typically similar but not directly comparable.
+| Fold | NETC | SNFH | ET | RC |
+|------|------|------|----|----|
+| 0 | 0.657 | 0.854 | 0.752 | 0.753 |
+| 1 | 0.616 | 0.879 | 0.752 | 0.777 |
+| 2 | TBD | TBD | TBD | TBD |
+| 3 | 0.653 | 0.873 | 0.754 | 0.777 |
+| 4 | 0.630 | 0.869 | 0.765 | 0.761 |
+| **Mean** | **0.639** | **0.869** | **0.756** | **0.767** |
+| Std | 0.018 | 0.011 | 0.006 | 0.012 |
+
+**CurriculumGAN: MedNeXt-B kernel 5x5x5** (curriculum-scheduled GliGAN augmentation)
+
+| Fold | NETC | SNFH | ET | RC |
+|------|------|------|----|----|
+| 0 | TBD | TBD | TBD | TBD |
+| 1 | TBD | TBD | TBD | TBD |
+| 2 | TBD | TBD | TBD | TBD |
+| 3 | TBD | TBD | TBD | TBD |
+| 4 | TBD | TBD | TBD | TBD |
+| **Mean** | **TBD** | **TBD** | **TBD** | **TBD** |
+
+### Holdout evaluation (162 cases, disjoint from training)
+
+| Method | NETC | SNFH | ET | RC |
+|--------|------|------|----|----|
+| Baseline (5-fold ensemble) | TBD | TBD | TBD | TBD |
+| CurriculumGAN (5-fold ensemble) | TBD | TBD | TBD | TBD |
+
+### Comparison with challenge results
+
+All scores are **lesion-wise Dice**. Different evaluation sets are noted.
+
+| Method | NETC | SNFH | ET | RC | Eval Set | Source |
+|--------|------|------|----|----|----------|--------|
+| **Ours: Baseline MedNeXt-B k5** | 0.639 | 0.869 | 0.756 | 0.767 | Internal CV (4 folds) | This repo |
+| **Ours: CurriculumGAN MedNeXt-B k5** | TBD | TBD | TBD | TBD | Internal CV | This repo |
+| **Ours: Baseline (holdout)** | TBD | TBD | TBD | TBD | Holdout (162 cases) | This repo |
+| **Ours: CurriculumGAN (holdout)** | TBD | TBD | TBD | TBD | Holdout (162 cases) | This repo |
+| 2025 Winner: nnU-Net baseline | 0.821 | 0.818 | 0.812 | 0.894 | Internal test | [Jia et al. 2025](https://arxiv.org/abs/2509.24973) |
+| 2025 Winner: Regular on-the-fly GAN | 0.824 | 0.815 | 0.813 | 0.883 | Internal test | [Jia et al. 2025](https://arxiv.org/abs/2509.24973) |
+| 2025 Winner: Custom on-the-fly GAN | 0.830 | 0.802 | 0.813 | 0.888 | Internal test | [Jia et al. 2025](https://arxiv.org/abs/2509.24973) |
+| 2025 Winner: 3-model ensemble | 0.833 | 0.813 | 0.812 | 0.893 | Internal test | [Jia et al. 2025](https://arxiv.org/abs/2509.24973) |
+| 2025 Winner: 3-model ensemble | 0.749 | 0.825 | 0.790 | 0.872 | Online validation | [Jia et al. 2025](https://arxiv.org/abs/2509.24973) |
+| 2024 Winner (Faking_it): best model | 0.787 | 0.870 | 0.756 | 0.705 | Online validation | [Ferreira et al. 2024](https://github.com/andre-fs-ferreira/BraTS_2023_2024_solutions) |
+| 2024 Winner (Faking_it): 30-model ens. | -- | -- | -- | -- | Test (overall 0.873) | [Ferreira et al. 2024](https://doi.org/10.5281/zenodo.14001262) |
+
+**Notes:**
+- Our internal CV uses the v2 dataset (1,459 cases from Anthony's train_val_set). The 2025 winner used the full BraTS 2024 GLI training set.
+- The 2025 winner's "internal test" is a held-out split from training data, comparable to our CV validation folds.
+- The 2025 winner's "online validation" scores are from the official BraTS platform (different cases, typically harder).
+- Our holdout set (162 cases) is disjoint from the 1,459 training cases, drawn from the full 1,621 BraTS-GLI 2024 corpus.
+- The 2024 winner used a 30-checkpoint ensemble (3 architectures x 5 folds x 2 data configs). We use a single architecture.
+
+## CurriculumGAN augmentation
+
+Curriculum-scheduled on-the-fly GliGAN tumor injection for MedNeXt-B training. Pretrained GliGAN generators synthesize realistic tumors and inject them into healthy brain regions during training, with injection probability increasing over epochs.
+
+**Curriculum schedule:**
+- Phase 1 (epochs 0-299): No injection. Learn clean anatomical representations from real data only.
+- Phase 2 (epochs 300-699): 30% injection rate. Model sees both real and synthetic tumors.
+- Phase 3 (epochs 700-999): 50% injection rate. Aggressive augmentation as learning rate decays.
+
+**Files:**
+- `gligan_augment.py` -- GliGAN augmentation module (vectorized, lazy imports)
+- `nnUNetTrainerV2_MedNeXt_CurriculumGAN.py` -- MedNeXt-B kernel5 trainer subclass
+- `train_mednext_v2_curriculum_gan.slurm` -- SLURM script with checkpoint safety guards
+
+**Dependencies:** MONAI (for loading pretrained Swin UNETR generator weights), scipy
+
+**GliGAN weights:** Download from [Zenodo](https://doi.org/10.5281/zenodo.14001262) (39.8 GB archive). Extract the `brats2024/` checkpoint directory containing 4 modality generators (Swin UNETR, ~720 MB each) and 1 label generator (ConvTranspose3d, 91 MB). Set `GLIGAN_WEIGHTS_DIR` to the extracted `brats2024/` path.
+
+### Training CurriculumGAN
+
+```bash
+# Install the trainer files into nnunet_mednext
+MEDNEXT_DIR=$(python3 -c "import nnunet_mednext; import os; print(os.path.dirname(nnunet_mednext.__file__))")
+cp gligan_augment.py "$MEDNEXT_DIR/training/network_training/MedNeXt/"
+cp nnUNetTrainerV2_MedNeXt_CurriculumGAN.py "$MEDNEXT_DIR/training/network_training/MedNeXt/"
+
+# Single fold
+sbatch train_mednext_v2_curriculum_gan.slurm 0
+
+# All 5 folds
+sbatch --array=0-4 train_mednext_v2_curriculum_gan.slurm
+```
 
 ## Training scripts
 
