@@ -13,8 +13,14 @@
 # (epoch 300, 700, 1000) to give each fold fair GPU time.
 #
 # Each fold is independently resumable: if more GPU nodes come online,
-# submit individual folds with the original train_mednext_v2_curriculum_gan.slurm
+# submit individual folds with train_mednext_v2_curriculum_gan.slurm
 # and they pick up from wherever this script left them.
+#
+# How it works:
+#   - Sets CURGAN_STOP_EPOCH env var before each mednextv1_train call
+#   - The CurriculumGAN trainer checks this in on_epoch_end() and exits
+#     cleanly when the epoch is reached, preserving model_latest
+#   - No kill signals, no checkpoint corruption risk
 #
 # Usage:
 #   sbatch train_curgan_roundrobin.slurm           # all folds, all phases
@@ -80,7 +86,7 @@ train_fold_to_epoch() {
     echo "[$(date +%H:%M:%S)] Fold $fold: currently at epoch $current, target $target"
 
     if [ "$current" -ge "$target" ]; then
-        echo "[$(date +%H:%M:%S)] Fold $fold: already past epoch $target, skipping"
+        echo "[$(date +%H:%M:%S)] Fold $fold: already at $current >= $target, skipping"
         return 0
     fi
 
@@ -96,34 +102,17 @@ train_fold_to_epoch() {
         echo "[$(date +%H:%M:%S)] Fold $fold: starting fresh"
     fi
 
-    # nnU-Net trains to max_num_epochs (1000). We can't tell it to stop at 300.
-    # Instead, we set max_num_epochs via env var and let the trainer respect it.
-    # But nnU-Net v1 doesn't support that. So we use a different approach:
-    # Run training in background, poll the log, and kill when target is reached.
-    mednextv1_train 3d_fullres "$TRAINER" "$TASK" "$fold" $resume &
-    local pid=$!
+    # Tell the trainer to stop at the target epoch
+    export CURGAN_STOP_EPOCH=$target
 
-    echo "[$(date +%H:%M:%S)] Fold $fold: training PID $pid, polling until epoch $target"
-
-    # Poll every 60s. Kill when target reached.
-    while kill -0 $pid 2>/dev/null; do
-        sleep 60
-        local ep=$(get_current_epoch "$fold")
-        if [ "$ep" -ge "$target" ] && [ "$target" -lt 1000 ]; then
-            echo "[$(date +%H:%M:%S)] Fold $fold: reached epoch $ep (target $target), pausing"
-            kill -TERM $pid 2>/dev/null
-            wait $pid 2>/dev/null
-            # Give nnU-Net a moment to flush checkpoint
-            sleep 10
-            return 0
-        fi
-    done
-
-    # Process exited on its own (finished 1000 or error)
-    wait $pid
+    echo "[$(date +%H:%M:%S)] Fold $fold: launching mednextv1_train (CURGAN_STOP_EPOCH=$target)"
+    mednextv1_train 3d_fullres "$TRAINER" "$TASK" "$fold" $resume
     local exit_code=$?
+
+    unset CURGAN_STOP_EPOCH
+
     local final_ep=$(get_current_epoch "$fold")
-    echo "[$(date +%H:%M:%S)] Fold $fold: training exited (code $exit_code) at epoch $final_ep"
+    echo "[$(date +%H:%M:%S)] Fold $fold: exited (code $exit_code) at epoch $final_ep"
     return $exit_code
 }
 
@@ -133,6 +122,7 @@ echo ""
 for target in "${PHASE_EPOCHS[@]}"; do
     echo "=========================================="
     echo "  PHASE TARGET: epoch $target"
+    echo "  Time: $(date)"
     echo "=========================================="
     for fold in "${FOLDS[@]}"; do
         current=$(get_current_epoch "$fold")
