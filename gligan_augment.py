@@ -186,10 +186,10 @@ class GliGANAugmenter:
             weight_path = os.path.join(mod_dir, pt_files[-1])
 
             gen = SwinUNETR(
-                img_size=(96, 96, 96),
                 in_channels=self.in_channels,
                 out_channels=self.out_channels,
                 feature_size=self.feature_size,
+                spatial_dims=3,
                 use_checkpoint=False,
             )
             state = torch.load(weight_path, map_location='cpu')['state_dict']
