@@ -163,41 +163,34 @@ Labels where both GT and prediction are empty are marked `"absent"` and excluded
 
 ## Results
 
-### Lesion-wise Dice (cross-validation, 5-fold, 292 cases per fold)
+### Baseline: MedNeXt-B kernel 5x5x5 (1000 epochs, Task501, 1459 training cases)
 
-**Baseline: MedNeXt-B kernel 5x5x5** (1000 epochs, Task501, 1459 training cases)
+**Per-fold cross-validation** (292 cases per fold, offline full-volume inference)
 
-| Fold | NETC | SNFH | ET | RC |
-|------|------|------|----|----|
-| 0 | 0.657 | 0.854 | 0.752 | 0.753 |
-| 1 | 0.616 | 0.879 | 0.752 | 0.777 |
-| 2 | 0.724 | 0.859 | 0.751 | 0.787 |
-| 3 | 0.653 | 0.873 | 0.754 | 0.777 |
-| 4 | 0.630 | 0.869 | 0.765 | 0.761 |
-| **Mean** | **0.656** | **0.867** | **0.755** | **0.771** |
-| Std | 0.040 | 0.010 | 0.006 | 0.013 |
+| Fold | Lesion NETC | Lesion SNFH | Lesion ET | Lesion RC | Voxel NETC | Voxel SNFH | Voxel ET | Voxel RC |
+|------|-------------|-------------|-----------|-----------|------------|------------|----------|----------|
+| 0 | 0.657 | 0.854 | 0.752 | 0.753 | 0.577 | 0.893 | 0.759 | 0.731 |
+| 1 | 0.616 | 0.879 | 0.752 | 0.777 | 0.564 | 0.902 | 0.740 | 0.745 |
+| 2 | 0.724 | 0.859 | 0.751 | 0.787 | 0.644 | 0.896 | 0.753 | 0.766 |
+| 3 | 0.653 | 0.873 | 0.754 | 0.777 | 0.640 | 0.900 | 0.770 | 0.762 |
+| 4 | 0.630 | 0.869 | 0.765 | 0.761 | 0.552 | 0.899 | 0.781 | 0.753 |
+| **Mean** | **0.656** | **0.867** | **0.755** | **0.771** | **0.595** | **0.898** | **0.761** | **0.751** |
+| Std | 0.040 | 0.010 | 0.006 | 0.013 | 0.041 | 0.004 | 0.016 | 0.014 |
 
-**CurriculumGAN: MedNeXt-B kernel 5x5x5** (curriculum-scheduled GliGAN augmentation)
+Lesion-wise Dice (per-lesion matching with FP penalty) is the BraTS 2024 challenge metric. Voxel-wise Dice is from nnU-Net's `validation_raw/summary.json`. NETC scores higher on lesion-wise (small lesions get fair per-lesion credit) while SNFH scores higher on voxel-wise (large region benefits from volume counting).
 
-| Fold | NETC | SNFH | ET | RC |
-|------|------|------|----|----|
+Postprocessing (connected component removal via `mednextv1_determine_postprocessing`) did not help: `for_which_classes: []`. Raw predictions are used as final.
+
+### CurriculumGAN: MedNeXt-B kernel 5x5x5 (curriculum-scheduled GliGAN augmentation)
+
+| Fold | Lesion NETC | Lesion SNFH | Lesion ET | Lesion RC |
+|------|-------------|-------------|-----------|-----------|
 | 0 | TBD | TBD | TBD | TBD |
 | 1 | TBD | TBD | TBD | TBD |
 | 2 | TBD | TBD | TBD | TBD |
 | 3 | TBD | TBD | TBD | TBD |
 | 4 | TBD | TBD | TBD | TBD |
 | **Mean** | **TBD** | **TBD** | **TBD** | **TBD** |
-
-### nnU-Net voxel-wise Dice (cross-validation, 1459 cases)
-
-From `mednextv1_determine_postprocessing` (consolidates all 5 folds):
-
-| Metric | NETC | SNFH | ET | RC |
-|--------|------|------|----|----|
-| Raw | 0.596 | 0.898 | 0.761 | 0.751 |
-| Postprocessed | 0.584 | 0.880 | 0.745 | 0.745 |
-
-Postprocessing (connected component removal) did not help: `for_which_classes: []`. Raw predictions are used as final.
 
 ### Holdout evaluation (162 cases, disjoint from training)
 
