@@ -84,7 +84,7 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
         """Save checkpoint with adaptive state appended."""
         super().save_checkpoint(fname, save_optimizer)
         # Append adaptive state to the saved checkpoint
-        ckpt = torch.load(fname, map_location='cpu')
+        ckpt = torch.load(fname, map_location='cpu', weights_only=False)
         ckpt['adaptive_state'] = {
             'per_class_gan_prob': self.per_class_gan_prob,
             'ema_dice': self.ema_dice,

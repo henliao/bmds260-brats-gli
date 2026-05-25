@@ -232,14 +232,16 @@ All scores are **lesion-wise Dice**. Different evaluation sets are noted.
 
 ## CurriculumGAN augmentation
 
-Performance-adaptive on-the-fly GliGAN tumor injection for MedNeXt-B training. Pretrained GliGAN generators synthesize realistic tumors and inject them into healthy brain regions during training. Unlike fixed-schedule approaches, the injection probability adapts per-class based on validation Dice trajectory.
+Performance-adaptive on-the-fly GliGAN tumor injection for MedNeXt-B training. Pretrained GliGAN generators synthesize realistic tumors and inject them into healthy brain regions during training. Unlike fixed-schedule approaches, the injection probability and label generation both adapt per-class based on EMA-smoothed validation Dice trajectories. See [docs/METHOD.md](docs/METHOD.md) for full design rationale.
 
 **Adaptive schedule:**
 - GAN injection starts at epoch 0 with a baseline rate (15%) for all classes.
-- Per-class online validation Dice is tracked over a rolling window (50 epochs).
-- When a class plateaus (improvement below threshold over the window), its GAN injection rate increases by 5% per detection, up to a per-class maximum.
-- NETC (the rarest/hardest class) has a lower plateau threshold (0.003 vs 0.005) and higher max rate (60% vs 50%), so augmentation ramps up earlier and harder for NETC.
-- When NETC is in plateau, the label generator uses rejection sampling (up to 5 attempts) to bias toward NETC-heavy synthetic tumors, increasing NETC voxel representation in training.
+- Per-class online validation Dice is smoothed via EMA (alpha=0.1) and tracked over a 50-epoch lookback window.
+- When a class plateaus (EMA improvement below threshold), its GAN injection rate increases (+0.05 per detection). When it improves again, the rate decays back toward baseline (-0.03). Bidirectional, not ratchet-only.
+- NETC has a lower plateau threshold (0.005 vs 0.01) and higher max rate (60% vs 50%).
+- **Class-weighted label generation:** per-class binarization thresholds on the label GAN output are modulated by the current injection rate. At baseline (0.15): threshold 0.5 (normal). At max NETC rate (0.60): threshold -0.2 (~3x larger NETC region). This directly controls how much of each class appears in synthetic tumors without rejection sampling.
+- **Anatomical enforcement:** labels are cleaned to remove class voxels outside the dilated whole-tumor boundary and tiny isolated components (<5 voxels).
+- **Checkpoint persistence:** adaptive state (EMA history, per-class rates) survives 48h wall-time restarts.
 
 **Files:**
 - `gligan_augment.py` -- GliGAN augmentation module (vectorized, lazy imports)
