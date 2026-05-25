@@ -177,7 +177,13 @@ Labels where both GT and prediction are empty are marked `"absent"` and excluded
 | **Mean** | **0.656** | **0.867** | **0.755** | **0.771** | **0.595** | **0.898** | **0.761** | **0.751** |
 | Std | 0.040 | 0.010 | 0.006 | 0.013 | 0.041 | 0.004 | 0.016 | 0.014 |
 
-Lesion-wise Dice (per-lesion matching with FP penalty) is the BraTS 2024 challenge metric. Voxel-wise Dice is from nnU-Net's `validation_raw/summary.json`. NETC scores higher on lesion-wise (small lesions get fair per-lesion credit) while SNFH scores higher on voxel-wise (large region benefits from volume counting).
+**Pooled cross-validation** (all 1459 cases evaluated together, lesion-wise Dice)
+
+| NETC | SNFH | ET | RC |
+|------|------|----|----|
+| 0.656 +/- 0.339 (median 0.786, n=659) | 0.867 +/- 0.166 (median 0.927, n=1457) | 0.755 +/- 0.284 (median 0.877, n=1129) | 0.771 +/- 0.293 (median 0.906, n=1309) |
+
+Lesion-wise Dice (per-lesion matching with FP penalty) is the BraTS 2024 challenge metric. Voxel-wise Dice is from nnU-Net's `validation_raw/summary.json`. NETC scores higher on lesion-wise (small lesions get fair per-lesion credit) while SNFH scores higher on voxel-wise (large region benefits from volume counting). Pooled CV weights all cases equally; per-fold mean weights folds equally. Results are nearly identical, confirming balanced folds.
 
 Postprocessing (connected component removal via `mednextv1_determine_postprocessing`) did not help: `for_which_classes: []`. Raw predictions are used as final.
 
@@ -226,12 +232,14 @@ All scores are **lesion-wise Dice**. Different evaluation sets are noted.
 
 ## CurriculumGAN augmentation
 
-Curriculum-scheduled on-the-fly GliGAN tumor injection for MedNeXt-B training. Pretrained GliGAN generators synthesize realistic tumors and inject them into healthy brain regions during training, with injection probability increasing over epochs.
+Performance-adaptive on-the-fly GliGAN tumor injection for MedNeXt-B training. Pretrained GliGAN generators synthesize realistic tumors and inject them into healthy brain regions during training. Unlike fixed-schedule approaches, the injection probability adapts per-class based on validation Dice trajectory.
 
-**Curriculum schedule:**
-- Phase 1 (epochs 0-299): No injection. Learn clean anatomical representations from real data only.
-- Phase 2 (epochs 300-699): 30% injection rate. Model sees both real and synthetic tumors.
-- Phase 3 (epochs 700-999): 50% injection rate. Aggressive augmentation as learning rate decays.
+**Adaptive schedule:**
+- GAN injection starts at epoch 0 with a baseline rate (15%) for all classes.
+- Per-class online validation Dice is tracked over a rolling window (50 epochs).
+- When a class plateaus (improvement below threshold over the window), its GAN injection rate increases by 5% per detection, up to a per-class maximum.
+- NETC (the rarest/hardest class) has a lower plateau threshold (0.003 vs 0.005) and higher max rate (60% vs 50%), so augmentation ramps up earlier and harder for NETC.
+- When NETC is in plateau, the label generator uses rejection sampling (up to 5 attempts) to bias toward NETC-heavy synthetic tumors, increasing NETC voxel representation in training.
 
 **Files:**
 - `gligan_augment.py` -- GliGAN augmentation module (vectorized, lazy imports)
