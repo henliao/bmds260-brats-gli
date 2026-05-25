@@ -3,23 +3,18 @@ MedNeXt-B kernel5 trainer with performance-adaptive GliGAN augmentation.
 
 Schedule adapts to per-class validation Dice:
   - GAN injection starts at epoch 0 with a baseline rate (15%).
-  - Per-class Dice is tracked over a rolling window (50 epochs).
-  - When a class plateaus (improvement < threshold over window), GAN injection
-    rate increases for that class.
-  - NETC (label 1) has a lower plateau threshold and higher max injection rate,
-    reflecting its status as the hardest/rarest class.
-  - When NETC is in plateau, the label generator biases toward NETC-heavy
-    synthetic tumors (rejection sampling).
-
-Paper framing: "Performance-adaptive GAN augmentation: injection probability is
-modulated per-class based on validation Dice trajectory, concentrating synthetic
-data where the model needs it most."
+  - Per-class Dice is smoothed via EMA (alpha=0.1) to filter patch-level noise.
+  - When a class's smoothed Dice plateaus over a 50-epoch lookback, its GAN
+    injection rate increases and its label generation threshold decreases
+    (producing larger synthetic regions for that class).
+  - When a class improves again, rates decay back toward baseline.
+  - Adaptive state (EMA history, per-class rates) is saved/restored in checkpoints
+    so the schedule survives wall-time restarts.
 """
 
 import os
 import numpy as np
 import torch
-from collections import deque
 
 from nnunet_mednext.training.network_training.MedNeXt.nnUNetTrainerV2_MedNeXt import (
     nnUNetTrainerV2_MedNeXt_B_kernel5,
@@ -37,36 +32,45 @@ except ImportError:
 
 DEFAULT_WEIGHTS_DIR = os.path.expanduser("~/bmds260/gligan_weights/brats2024")
 
-# BraTS 2024 class indices: 1=NETC, 2=SNFH, 3=ET, 4=RC
-# nnU-Net foreground classes are indexed 0-3 in online eval (0=NETC, 1=SNFH, 2=ET, 3=RC)
+# nnU-Net foreground classes: 0=NETC, 1=SNFH, 2=ET, 3=RC
 CLASS_NAMES = {0: "NETC", 1: "SNFH", 2: "ET", 3: "RC"}
+
+# Default label threshold on tanh scale [-1, 1] (matches pretrained generator)
+DEFAULT_LABEL_THRESH = 0.5
+
+# Threshold range for class weighting: [min_thresh, DEFAULT_LABEL_THRESH]
+# Lower threshold = larger label region. min_thresh=-0.2 roughly triples region size.
+MIN_LABEL_THRESH = -0.2
 
 
 class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_kernel5):
-    """
-    MedNeXt-B kernel5 with performance-adaptive GliGAN augmentation.
-    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         # --- Adaptive schedule parameters ---
-        self.gan_base_prob = 0.15          # baseline injection rate from epoch 0
-        self.gan_max_prob = 0.50           # max injection rate for normal classes
-        self.gan_max_prob_netc = 0.60      # max injection rate for NETC
-        self.gan_ramp_step = 0.05          # how much to increase prob per plateau detection
+        self.gan_base_prob = 0.15
+        self.gan_max_prob = 0.50
+        self.gan_max_prob_netc = 0.60
+        self.gan_ramp_step = 0.05
+        self.gan_decay_step = 0.03
+
+        # EMA smoothing
+        self.ema_alpha = 0.1
+        self.ema_dice = [None] * 4
 
         # Plateau detection
-        self.plateau_window = 50           # rolling window size (epochs)
-        self.plateau_threshold = 0.005     # min Dice improvement over window to NOT be plateau
-        self.plateau_threshold_netc = 0.003  # lower threshold for NETC (triggers earlier)
+        self.lookback = 50
+        self.plateau_threshold = 0.01
+        self.plateau_threshold_netc = 0.005
+        self.improvement_threshold = 0.02
+        self.improvement_threshold_netc = 0.01
 
         # Per-class state
-        self.per_class_gan_prob = [self.gan_base_prob] * 4  # [NETC, SNFH, ET, RC]
-        self.per_class_dice_history = [deque(maxlen=self.plateau_window) for _ in range(4)]
-        self.netc_plateau = False          # flag for NETC-biased label generation
+        self.per_class_gan_prob = [self.gan_base_prob] * 4
+        self.ema_history = [[] for _ in range(4)]
 
-        # Track per-class Dice each epoch (populated in finish_online_evaluation)
+        # Per-class Dice from this epoch (set in finish_online_evaluation)
         self._current_epoch_class_dice = None
 
         # GliGAN augmenter (lazy loaded)
@@ -74,20 +78,46 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
         self._gligan_load_attempted = False
         self.gligan_weights_dir = os.environ.get("GLIGAN_WEIGHTS_DIR", DEFAULT_WEIGHTS_DIR)
 
+    # --- Checkpoint save/restore for adaptive state ---
+
+    def save_checkpoint(self, fname, save_optimizer=True):
+        """Save checkpoint with adaptive state appended."""
+        super().save_checkpoint(fname, save_optimizer)
+        # Append adaptive state to the saved checkpoint
+        ckpt = torch.load(fname, map_location='cpu')
+        ckpt['adaptive_state'] = {
+            'per_class_gan_prob': self.per_class_gan_prob,
+            'ema_dice': self.ema_dice,
+            'ema_history': [list(h) for h in self.ema_history],
+        }
+        torch.save(ckpt, fname)
+
+    def load_checkpoint_ram(self, saved, train=True):
+        """Restore checkpoint and adaptive state."""
+        super().load_checkpoint_ram(saved, train)
+        if 'adaptive_state' in saved:
+            state = saved['adaptive_state']
+            self.per_class_gan_prob = state.get('per_class_gan_prob', [self.gan_base_prob] * 4)
+            self.ema_dice = state.get('ema_dice', [None] * 4)
+            self.ema_history = [list(h) for h in state.get('ema_history', [[] for _ in range(4)])]
+            self.print_to_log_file(
+                f"Restored adaptive state: probs={self.per_class_gan_prob}, "
+                f"EMA history lengths={[len(h) for h in self.ema_history]}")
+        else:
+            self.print_to_log_file("No adaptive state in checkpoint, starting fresh.")
+
+    # --- GliGAN management ---
+
     def _get_gligan(self):
-        """Lazy-load GliGAN augmenter on first use."""
         if self._gligan is not None:
             return self._gligan
         if self._gligan_load_attempted:
             return None
-
         self._gligan_load_attempted = True
 
         if not os.path.isdir(self.gligan_weights_dir):
             self.print_to_log_file(
-                f"WARNING: GliGAN weights dir not found: {self.gligan_weights_dir}. "
-                f"Running without GAN augmentation."
-            )
+                f"WARNING: GliGAN weights dir not found: {self.gligan_weights_dir}")
             return None
 
         try:
@@ -95,65 +125,83 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
             self._gligan = GliGANAugmenter(
                 weights_dir=self.gligan_weights_dir,
                 device='cuda' if torch.cuda.is_available() else 'cpu',
-                in_channels=5,
-                out_channels=1,
-                feature_size=48,
-                label_out_channels=4,
-            )
+                in_channels=5, out_channels=1, feature_size=48, label_out_channels=4)
             self._gligan.load()
             self.print_to_log_file("GliGAN augmenter loaded successfully.")
             return self._gligan
         except Exception as e:
-            self.print_to_log_file(f"WARNING: Failed to load GliGAN: {e}. Running without GAN augmentation.")
+            self.print_to_log_file(f"WARNING: Failed to load GliGAN: {e}")
             return None
 
+    # --- Adaptive schedule ---
+
     def get_gan_probability(self):
-        """
-        Get current per-sample GAN injection probability.
-        Returns the max across all per-class probabilities (we inject a full
-        synthetic tumor, but bias the label generator based on which class needs help).
-        """
         return max(self.per_class_gan_prob)
 
-    def _detect_plateaus(self):
+    def _prob_to_threshold(self, cls_idx):
         """
-        Check each class's Dice history for plateau. If plateaued, bump its
-        GAN injection probability.
-        """
-        if self.epoch < self.plateau_window:
-            return  # not enough history yet
+        Map per-class GAN probability to label generation threshold.
 
+        At base_prob: threshold = DEFAULT_LABEL_THRESH (0.5, normal)
+        At max_prob:  threshold = MIN_LABEL_THRESH (-0.2, ~3x larger region)
+        Linear interpolation between.
+        """
+        prob = self.per_class_gan_prob[cls_idx]
+        max_prob = self.gan_max_prob_netc if cls_idx == 0 else self.gan_max_prob
+        # Fraction of the way from base to max
+        frac = (prob - self.gan_base_prob) / max(max_prob - self.gan_base_prob, 1e-8)
+        frac = max(0.0, min(1.0, frac))
+        return DEFAULT_LABEL_THRESH - frac * (DEFAULT_LABEL_THRESH - MIN_LABEL_THRESH)
+
+    def _get_class_thresholds(self):
+        """Get current per-class label generation thresholds."""
+        return {i: self._prob_to_threshold(i) for i in range(4)}
+
+    def _update_ema(self, cls_idx, raw_dice):
+        if self.ema_dice[cls_idx] is None:
+            self.ema_dice[cls_idx] = raw_dice
+        else:
+            self.ema_dice[cls_idx] = (
+                self.ema_alpha * raw_dice +
+                (1 - self.ema_alpha) * self.ema_dice[cls_idx])
+        self.ema_history[cls_idx].append(self.ema_dice[cls_idx])
+
+    def _adapt_rates(self):
+        """Bidirectional rate adaptation based on smoothed Dice trajectory."""
         for cls_idx in range(4):
-            history = self.per_class_dice_history[cls_idx]
-            if len(history) < self.plateau_window:
+            history = self.ema_history[cls_idx]
+            if len(history) < self.lookback:
                 continue
 
-            # Improvement = current Dice - Dice from (window) epochs ago
-            recent = np.mean(list(history)[-10:])  # last 10 epochs
-            earlier = np.mean(list(history)[:10])   # first 10 of window
-            improvement = recent - earlier
+            improvement = history[-1] - history[-self.lookback]
 
-            threshold = self.plateau_threshold_netc if cls_idx == 0 else self.plateau_threshold
+            plat_thresh = self.plateau_threshold_netc if cls_idx == 0 else self.plateau_threshold
+            impr_thresh = self.improvement_threshold_netc if cls_idx == 0 else self.improvement_threshold
             max_prob = self.gan_max_prob_netc if cls_idx == 0 else self.gan_max_prob
 
-            if improvement < threshold:
-                old_prob = self.per_class_gan_prob[cls_idx]
+            old_prob = self.per_class_gan_prob[cls_idx]
+
+            if improvement < plat_thresh:
                 new_prob = min(old_prob + self.gan_ramp_step, max_prob)
                 if new_prob > old_prob:
-                    self.per_class_gan_prob[cls_idx] = new_prob
                     self.print_to_log_file(
-                        f"  ADAPTIVE: {CLASS_NAMES[cls_idx]} plateaued "
-                        f"(improvement={improvement:.4f} < {threshold}). "
-                        f"GAN prob: {old_prob:.2f} -> {new_prob:.2f}")
+                        f"  ADAPTIVE: {CLASS_NAMES[cls_idx]} plateau "
+                        f"(EMA delta={improvement:.4f} < {plat_thresh}). "
+                        f"GAN: {old_prob:.2f} -> {new_prob:.2f}, "
+                        f"thresh: {self._prob_to_threshold(cls_idx):.2f} -> {DEFAULT_LABEL_THRESH - (new_prob - self.gan_base_prob) / max(max_prob - self.gan_base_prob, 1e-8) * (DEFAULT_LABEL_THRESH - MIN_LABEL_THRESH):.2f}")
+                self.per_class_gan_prob[cls_idx] = new_prob
+            elif improvement > impr_thresh:
+                new_prob = max(old_prob - self.gan_decay_step, self.gan_base_prob)
+                if new_prob < old_prob:
+                    self.print_to_log_file(
+                        f"  ADAPTIVE: {CLASS_NAMES[cls_idx]} improving "
+                        f"(EMA delta={improvement:.4f} > {impr_thresh}). "
+                        f"GAN: {old_prob:.2f} -> {new_prob:.2f}")
+                self.per_class_gan_prob[cls_idx] = new_prob
 
-        # Update NETC plateau flag for label generation bias
-        self.netc_plateau = self.per_class_gan_prob[0] > self.gan_base_prob
+    # --- Online evaluation override ---
 
     def finish_online_evaluation(self):
-        """
-        Override to capture per-class Dice before the parent resets accumulators.
-        """
-        # Compute per-class Dice from accumulated TP/FP/FN
         tp = np.sum(self.online_eval_tp, 0)
         fp = np.sum(self.online_eval_fp, 0)
         fn = np.sum(self.online_eval_fn, 0)
@@ -161,50 +209,47 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
         per_class_dice = [2 * t / (2 * t + f + n + 1e-8) for t, f, n in zip(tp, fp, fn)]
         self._current_epoch_class_dice = per_class_dice
 
-        # Store in per-class history
         for cls_idx, dice_val in enumerate(per_class_dice):
             if not np.isnan(dice_val):
-                self.per_class_dice_history[cls_idx].append(dice_val)
+                self._update_ema(cls_idx, float(dice_val))
 
-        # Call parent (logs mean Dice, resets accumulators)
         super().finish_online_evaluation()
 
     def on_epoch_end(self):
-        """Override to run plateau detection after online eval."""
         ret = super().on_epoch_end()
 
-        # Log per-class Dice
         if self._current_epoch_class_dice is not None:
-            dice_str = ", ".join(
-                f"{CLASS_NAMES[i]}={d:.4f}" for i, d in enumerate(self._current_epoch_class_dice)
-            )
-            self.print_to_log_file(f"  Per-class Dice: {dice_str}")
-            prob_str = ", ".join(
-                f"{CLASS_NAMES[i]}={p:.2f}" for i, p in enumerate(self.per_class_gan_prob)
-            )
-            self.print_to_log_file(f"  GAN probs: {prob_str} | NETC-bias: {self.netc_plateau}")
+            raw_str = ", ".join(f"{CLASS_NAMES[i]}={d:.4f}"
+                                for i, d in enumerate(self._current_epoch_class_dice))
+            ema_str = ", ".join(
+                f"{CLASS_NAMES[i]}={e:.4f}" if e is not None else f"{CLASS_NAMES[i]}=N/A"
+                for i, e in enumerate(self.ema_dice))
+            prob_str = ", ".join(f"{CLASS_NAMES[i]}={p:.2f}"
+                                for i, p in enumerate(self.per_class_gan_prob))
+            thresh_str = ", ".join(f"{CLASS_NAMES[i]}={self._prob_to_threshold(i):.2f}"
+                                  for i in range(4))
+            self.print_to_log_file(f"  Per-class Dice (raw): {raw_str}")
+            self.print_to_log_file(f"  Per-class Dice (EMA): {ema_str}")
+            self.print_to_log_file(f"  GAN probs: {prob_str}")
+            self.print_to_log_file(f"  Label thresholds: {thresh_str}")
 
-        # Detect plateaus and adapt
-        self._detect_plateaus()
-
+        self._adapt_rates()
         self._current_epoch_class_dice = None
         return ret
 
+    # --- Training iteration with GAN augmentation ---
+
     def run_iteration(self, data_generator, do_backprop=True, run_online_evaluation=False):
-        """
-        Override run_iteration to inject GAN augmentation between data loading
-        and forward pass, with performance-adaptive probability.
-        """
         data_dict = next(data_generator)
         data = data_dict['data']
         target = data_dict['target']
 
-        # Apply GAN augmentation (only during training, not validation)
         if do_backprop:
             gan_prob = self.get_gan_probability()
             gligan = self._get_gligan() if gan_prob > 0 else None
 
             if gligan is not None and gan_prob > 0:
+                class_thresholds = self._get_class_thresholds()
                 batch_size = data.shape[0]
                 for b in range(batch_size):
                     if np.random.rand() < gan_prob:
@@ -212,9 +257,9 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
                             data_np = data[b].numpy() if isinstance(data, torch.Tensor) else data[b]
                             seg_np = target[b].numpy() if isinstance(target, torch.Tensor) else target[b]
 
-                            data_aug, seg_aug = self._augment_with_bias(
-                                gligan, data_np.copy(), seg_np.copy()
-                            )
+                            data_aug, seg_aug = gligan.augment_volume(
+                                data_np.copy(), seg_np.copy(),
+                                class_thresholds=class_thresholds)
 
                             if isinstance(data, torch.Tensor):
                                 data[b] = torch.from_numpy(data_aug)
@@ -239,7 +284,6 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
                 output = self.network(data)
                 del data
                 l = self.loss(output, target)
-
             if do_backprop:
                 self.amp_grad_scaler.scale(l).backward()
                 self.amp_grad_scaler.unscale_(self.optimizer)
@@ -250,7 +294,6 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
             output = self.network(data)
             del data
             l = self.loss(output, target)
-
             if do_backprop:
                 l.backward()
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
@@ -261,34 +304,3 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
 
         del target
         return l.detach().cpu().numpy()
-
-    def _augment_with_bias(self, gligan, data_np, seg_np):
-        """
-        Apply GliGAN augmentation with NETC bias when NETC is plateaued.
-
-        When NETC-biased: rejection-sample the label generator up to 5 times,
-        keeping only synthetic tumors that contain NETC (label 1). This increases
-        the proportion of NETC voxels in training without changing the GAN itself.
-        """
-        if not self.netc_plateau:
-            return gligan.augment_volume(data_np, seg_np)
-
-        # NETC-biased: try up to 5 times to get a tumor with NETC
-        from nnunet_mednext.training.network_training.MedNeXt.gligan_augment import generate_random_label
-        best_data, best_seg = None, None
-        best_netc_count = 0
-
-        for attempt in range(5):
-            data_try, seg_try = gligan.augment_volume(data_np.copy(), seg_np.copy())
-            # Count new NETC voxels (label 1 in augmented but not in original)
-            new_netc = np.sum((seg_try[0] == 1) & (seg_np[0] != 1))
-            if new_netc > best_netc_count:
-                best_netc_count = new_netc
-                best_data = data_try
-                best_seg = seg_try
-            if new_netc > 50:  # good enough, stop early
-                break
-
-        if best_data is not None:
-            return best_data, best_seg
-        return data_np, seg_np

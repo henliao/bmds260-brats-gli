@@ -4,8 +4,11 @@ On-the-fly GliGAN augmentation for nnU-Net v1 training.
 Loads pretrained GliGAN generators (4 modality-specific Swin UNETRs + 1 label GAN)
 and injects synthetic tumors into training batches. All operations vectorized.
 
-All heavy imports (monai, scipy) are deferred to load() time so that nnU-Net's
-trainer discovery doesn't fail when these packages are missing.
+Supports class-weighted label generation: per-class binarization thresholds control
+how much of the latent space maps to each tumor subregion. Lower threshold = larger
+region. Morphological cleanup enforces anatomical validity.
+
+All heavy imports (monai, scipy) are deferred to load() time.
 """
 
 import os
@@ -47,7 +50,6 @@ class LabelGenerator(nn.Module):
 
 
 def rescale_array(arr, minv=0.0, maxv=1.0):
-    """Rescale array to [minv, maxv]."""
     mina = arr.min()
     maxa = arr.max()
     if mina == maxa:
@@ -56,7 +58,6 @@ def rescale_array(arr, minv=0.0, maxv=1.0):
 
 
 def add_gaussian_noise_vectorized(scan, label_mask):
-    """Vectorized: replace tumor region with Gaussian noise, rescale to [-1,1]."""
     scan_noisy = scan.copy()
     tumor_mask = label_mask != 0
     noise = np.random.randn(*scan.shape).astype(np.float32)
@@ -66,21 +67,18 @@ def add_gaussian_noise_vectorized(scan, label_mask):
 
 
 def correct_label_vectorized(label, brain_mask, original_label):
-    """Vectorized: zero out label voxels outside brain or overlapping existing tumor."""
     invalid = (brain_mask == 0) | (original_label != 0)
     label[invalid] = 0
     return label
 
 
 def correct_background_vectorized(healthy_crop_norm, imgs_recon):
-    """Vectorized: clamp background to -1, values to [-1, 1]."""
     result = imgs_recon.copy()
     result[healthy_crop_norm == -1] = -1
     return np.clip(result, -1, 1)
 
 
 def linear_interpolation_vectorized(recon, healthy_crop, original_label_crop, noise_mask):
-    """Vectorized linear intensity correction using boundary voxels."""
     from scipy.ndimage import binary_dilation
     dilated_noise = binary_dilation(noise_mask > 0, iterations=5)
     boundary = (healthy_crop != 0) & (original_label_crop == 0) & (~dilated_noise)
@@ -91,7 +89,6 @@ def linear_interpolation_vectorized(recon, healthy_crop, original_label_crop, no
     x_vals = recon[boundary].ravel()
     y_vals = healthy_crop[boundary].ravel()
 
-    # Sample up to 200 points for fitting
     if len(x_vals) > 200:
         idx = np.random.choice(len(x_vals), 200, replace=False)
         x_vals = x_vals[idx]
@@ -107,22 +104,52 @@ def linear_interpolation_vectorized(recon, healthy_crop, original_label_crop, no
     return result
 
 
-def generate_random_label(label_gen, device, out_channels=4):
-    """Generate a random tumor label mask using the label GAN."""
+# Default threshold on tanh output [-1, 1]. Original code used > 0.5 on tanh,
+# which is the pretrained generator's intended operating point.
+DEFAULT_TANH_THRESHOLD = 0.5
+
+
+def generate_random_label(label_gen, device, out_channels=4, class_thresholds=None):
+    """
+    Generate a random tumor label mask using the label GAN.
+
+    Args:
+        label_gen: LabelGenerator model
+        device: torch device
+        out_channels: number of output label channels
+        class_thresholds: per-channel thresholds on tanh output [-1, 1].
+            Default 0.5 for all (matches original pretrained behavior).
+            Lower = larger region for that class. Valid range: [-0.5, 0.9].
+            Keys/indices: 0=NETC, 1=SNFH, 2=ET, 3=RC.
+
+    Returns:
+        combined: (96, 96, 96) numpy array with labels 0-4
+    """
+    if class_thresholds is None:
+        class_thresholds = [DEFAULT_TANH_THRESHOLD] * out_channels
+    elif isinstance(class_thresholds, dict):
+        class_thresholds = [class_thresholds.get(i, DEFAULT_TANH_THRESHOLD)
+                            for i in range(out_channels)]
+
     with torch.no_grad():
         z = torch.randn(1, 100, device=device)
-        x = label_gen(z)
+        x = label_gen(z)  # tanh output, range [-1, 1]
 
     x_cpu = x.squeeze(0).cpu().numpy()
 
     channels = []
     for i in range(min(x_cpu.shape[0], out_channels)):
-        ch_tensor = torch.from_numpy(x_cpu[i:i+1]).unsqueeze(0).float()  # [1,1,D,H,W]
-        ch_resized = torch.nn.functional.interpolate(ch_tensor, size=(96, 96, 96), mode='trilinear', align_corners=False)
+        ch_tensor = torch.from_numpy(x_cpu[i:i+1]).unsqueeze(0).float()
+        ch_resized = F.interpolate(ch_tensor, size=(96, 96, 96),
+                                   mode='trilinear', align_corners=False)
         ch = ch_resized.squeeze(0).squeeze(0).numpy()
-        ch = (ch > 0.5).astype(np.float32)
+        thresh = class_thresholds[i] if i < len(class_thresholds) else DEFAULT_TANH_THRESHOLD
+        # Clamp threshold to valid range
+        thresh = max(-0.5, min(0.9, thresh))
+        ch = (ch > thresh).astype(np.float32)
         channels.append(ch)
 
+    # Combine with BraTS priority: SNFH outermost, NETC overwrites, ET overwrites
     combined = np.zeros((96, 96, 96), dtype=np.float32)
     if len(channels) >= 3:
         combined[channels[1] == 1] = 2  # SNFH
@@ -131,11 +158,46 @@ def generate_random_label(label_gen, device, out_channels=4):
     if len(channels) >= 4:
         combined[channels[3] == 1] = 4  # RC
 
+    combined = _enforce_anatomy(combined)
     return combined
 
 
+def _enforce_anatomy(label):
+    """
+    Enforce BraTS anatomical constraints on generated labels.
+
+    1. NETC and ET voxels outside the dilated whole-tumor region are removed
+    2. Tiny isolated components (< 5 voxels) per label are removed
+    """
+    from scipy.ndimage import binary_dilation, label as cc_label
+
+    whole_tumor = label > 0
+    if whole_tumor.sum() < 10:
+        return label
+
+    valid_region = binary_dilation(whole_tumor, iterations=1)
+
+    netc_mask = (label == 1) & valid_region
+    et_mask = (label == 3) & valid_region
+
+    # Remove tiny components
+    for mask in [netc_mask, et_mask]:
+        if mask.sum() == 0:
+            continue
+        labeled, n_comp = cc_label(mask)
+        for c in range(1, n_comp + 1):
+            if (labeled == c).sum() < 5:
+                mask[labeled == c] = False
+
+    result = np.zeros_like(label)
+    result[label == 2] = 2
+    result[netc_mask] = 1
+    result[et_mask] = 3
+    result[label == 4] = 4
+    return result
+
+
 def convert_label_to_multichannel_brats2024(label):
-    """Convert single-channel label to multi-channel for GliGAN input."""
     return np.stack([
         ((label == 1) | (label == 3)).astype(np.float32),
         ((label == 1) | (label == 2) | (label == 3)).astype(np.float32),
@@ -146,10 +208,7 @@ def convert_label_to_multichannel_brats2024(label):
 
 class GliGANAugmenter:
     """
-    On-the-fly GliGAN tumor augmentation.
-
-    Loads 4 modality generators (Swin UNETR) + 1 label generator.
-    Injects synthetic tumors into training volumes.
+    On-the-fly GliGAN tumor augmentation with class-weighted label generation.
     """
 
     def __init__(self, weights_dir, device='cuda',
@@ -166,11 +225,9 @@ class GliGANAugmenter:
         self.feature_size = feature_size
 
     def load(self):
-        """Load all generators. Call once after init."""
         if self._loaded:
             return
 
-        # Lazy import
         from monai.networks.nets.swin_unetr import SwinUNETR
 
         modalities = ['t1ce', 't1', 't2', 'flair']
@@ -178,7 +235,6 @@ class GliGANAugmenter:
             mod_dir = os.path.join(self.weights_dir, mod, 'weights')
             if not os.path.isdir(mod_dir):
                 raise FileNotFoundError(f"GliGAN weights not found: {mod_dir}")
-
             pt_files = sorted([f for f in os.listdir(mod_dir)
                                if f.startswith('generator_') and f.endswith('.pt')])
             if not pt_files:
@@ -186,12 +242,8 @@ class GliGANAugmenter:
             weight_path = os.path.join(mod_dir, pt_files[-1])
 
             gen = SwinUNETR(
-                in_channels=self.in_channels,
-                out_channels=self.out_channels,
-                feature_size=self.feature_size,
-                spatial_dims=3,
-                use_checkpoint=False,
-            )
+                in_channels=self.in_channels, out_channels=self.out_channels,
+                feature_size=self.feature_size, spatial_dims=3, use_checkpoint=False)
             state = torch.load(weight_path, map_location='cpu')['state_dict']
             gen.load_state_dict(state)
             gen.eval()
@@ -199,7 +251,6 @@ class GliGANAugmenter:
             self.generators[mod] = gen
             print(f"Loaded GliGAN generator: {mod} from {weight_path}")
 
-        # Load label generator
         label_dir = os.path.join(self.weights_dir, 'label', 'weights')
         if os.path.isdir(label_dir):
             label_files = sorted([f for f in os.listdir(label_dir)
@@ -207,8 +258,7 @@ class GliGANAugmenter:
                                   (f.endswith('.pth') or f.endswith('.pt'))])
             if label_files:
                 label_path = os.path.join(label_dir, label_files[-1])
-                self.label_gen = LabelGenerator(
-                    noise=100, out_channels=self.label_out_channels)
+                self.label_gen = LabelGenerator(noise=100, out_channels=self.label_out_channels)
                 state = torch.load(label_path, map_location='cpu')
                 if 'state_dict' in state:
                     state = state['state_dict']
@@ -219,13 +269,14 @@ class GliGANAugmenter:
 
         self._loaded = True
 
-    def augment_volume(self, data_np, seg_np):
+    def augment_volume(self, data_np, seg_np, class_thresholds=None):
         """
         Apply GliGAN augmentation to a single training volume.
 
         Args:
             data_np: (4, D, H, W) numpy array, 4 MRI modalities
             seg_np: (1, D, H, W) numpy array, segmentation labels
+            class_thresholds: optional per-class thresholds for label generation
 
         Returns:
             data_np, seg_np: augmented (same shape)
@@ -235,11 +286,8 @@ class GliGANAugmenter:
 
         C, D, H, W = data_np.shape
         seg = seg_np[0]
-
-        # Brain mask from first modality
         brain_mask = np.abs(data_np[0]) > 0.01
 
-        # Find random 96^3 patch location in brain, away from existing tumor
         for _ in range(50):
             brain_coords = np.argwhere(brain_mask)
             if len(brain_coords) < 100:
@@ -251,7 +299,6 @@ class GliGANAugmenter:
             y0, y1 = max(0, cy - 48), max(0, cy - 48) + 96
             x0, x1 = max(0, cx - 48), max(0, cx - 48) + 96
 
-            # Clamp
             if z1 > D: z0, z1 = D - 96, D
             if y1 > H: y0, y1 = H - 96, H
             if x1 > W: x0, x1 = W - 96, W
@@ -263,13 +310,12 @@ class GliGANAugmenter:
         else:
             return data_np, seg_np
 
-        # Generate random tumor label
         if self.label_gen is None:
             return data_np, seg_np
         new_label = generate_random_label(
-            self.label_gen, self.device, self.label_out_channels)
+            self.label_gen, self.device, self.label_out_channels,
+            class_thresholds=class_thresholds)
 
-        # Correct label
         brain_crop = brain_mask[z0:z1, y0:y1, x0:x1].astype(np.float32)
         orig_seg_crop = seg[z0:z1, y0:y1, x0:x1]
         new_label = correct_label_vectorized(new_label, brain_crop, orig_seg_crop)
@@ -278,8 +324,6 @@ class GliGANAugmenter:
             return data_np, seg_np
 
         label_mc = convert_label_to_multichannel_brats2024(new_label)
-
-        # nnU-Net modality order: T1, T1ce, T2, FLAIR
         mod_map = {0: 't1', 1: 't1ce', 2: 't2', 3: 'flair'}
 
         for mod_idx, mod_name in mod_map.items():
@@ -304,7 +348,6 @@ class GliGANAugmenter:
 
             data_np[mod_idx, z0:z1, y0:y1, x0:x1] = final_crop
 
-        # Update segmentation
         combined_seg = seg.copy()
         combined_seg[z0:z1, y0:y1, x0:x1] = np.maximum(
             combined_seg[z0:z1, y0:y1, x0:x1], new_label)
