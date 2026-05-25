@@ -171,11 +171,11 @@ Labels where both GT and prediction are empty are marked `"absent"` and excluded
 |------|------|------|----|----|
 | 0 | 0.657 | 0.854 | 0.752 | 0.753 |
 | 1 | 0.616 | 0.879 | 0.752 | 0.777 |
-| 2 | TBD | TBD | TBD | TBD |
+| 2 | 0.724 | 0.859 | 0.751 | 0.787 |
 | 3 | 0.653 | 0.873 | 0.754 | 0.777 |
 | 4 | 0.630 | 0.869 | 0.765 | 0.761 |
-| **Mean** | **0.639** | **0.869** | **0.756** | **0.767** |
-| Std | 0.018 | 0.011 | 0.006 | 0.012 |
+| **Mean** | **0.656** | **0.867** | **0.755** | **0.771** |
+| Std | 0.040 | 0.010 | 0.006 | 0.013 |
 
 **CurriculumGAN: MedNeXt-B kernel 5x5x5** (curriculum-scheduled GliGAN augmentation)
 
@@ -187,6 +187,17 @@ Labels where both GT and prediction are empty are marked `"absent"` and excluded
 | 3 | TBD | TBD | TBD | TBD |
 | 4 | TBD | TBD | TBD | TBD |
 | **Mean** | **TBD** | **TBD** | **TBD** | **TBD** |
+
+### nnU-Net voxel-wise Dice (cross-validation, 1459 cases)
+
+From `mednextv1_determine_postprocessing` (consolidates all 5 folds):
+
+| Metric | NETC | SNFH | ET | RC |
+|--------|------|------|----|----|
+| Raw | 0.596 | 0.898 | 0.761 | 0.751 |
+| Postprocessed | 0.584 | 0.880 | 0.745 | 0.745 |
+
+Postprocessing (connected component removal) did not help: `for_which_classes: []`. Raw predictions are used as final.
 
 ### Holdout evaluation (162 cases, disjoint from training)
 
@@ -201,7 +212,7 @@ All scores are **lesion-wise Dice**. Different evaluation sets are noted.
 
 | Method | NETC | SNFH | ET | RC | Eval Set | Source |
 |--------|------|------|----|----|----------|--------|
-| **Ours: Baseline MedNeXt-B k5** | 0.639 | 0.869 | 0.756 | 0.767 | Internal CV (4 folds) | This repo |
+| **Ours: Baseline MedNeXt-B k5** | 0.656 | 0.867 | 0.755 | 0.771 | Internal CV (5-fold) | This repo |
 | **Ours: CurriculumGAN MedNeXt-B k5** | TBD | TBD | TBD | TBD | Internal CV | This repo |
 | **Ours: Baseline (holdout)** | TBD | TBD | TBD | TBD | Holdout (162 cases) | This repo |
 | **Ours: CurriculumGAN (holdout)** | TBD | TBD | TBD | TBD | Holdout (162 cases) | This repo |
@@ -287,10 +298,10 @@ The CurriculumGAN SLURM script streams the nnU-Net training log to stdout in rea
 
 ```bash
 # tail the SLURM output (includes epoch, loss, curriculum phase transitions)
-tail -f ~/bmds260/logs/curgan_<JOBID>_<FOLD>.out
+tail -f ~/bmds260/logs/curgan_<JOBID>.out
 
 # check all folds at once
-for f in ~/bmds260/logs/curgan_*_*.out; do
+for f in ~/bmds260/logs/curgan_*.out; do
   echo "--- $f ---"
   tail -3 "$f"
   echo
