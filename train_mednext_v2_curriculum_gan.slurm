@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
 #SBATCH --time=48:00:00
-#SBATCH --output=/home/users/hankliao/bmds260/logs/curgan_%A_%a.out
+#SBATCH --output=/home/users/hankliao/bmds260/logs/curgan_%j.out
 
 FOLD=${SLURM_ARRAY_TASK_ID:-$1}
 if [ -z "$FOLD" ]; then
@@ -31,6 +31,7 @@ export nnUNet_raw_data_base=~/bmds260/nnunet/raw_data_base
 export nnUNet_preprocessed=~/bmds260/nnunet/preprocessed
 export RESULTS_FOLDER=~/bmds260/nnunet/results
 export GLIGAN_WEIGHTS_DIR=~/bmds260/gligan_weights/brats2024
+export PATH=~/.local/bin:$PATH
 
 mkdir -p ~/bmds260/logs
 
