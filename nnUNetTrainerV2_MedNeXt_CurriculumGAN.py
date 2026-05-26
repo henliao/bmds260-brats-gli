@@ -2,7 +2,7 @@
 MedNeXt-B kernel5 trainer with performance-adaptive GliGAN augmentation.
 
 Schedule adapts to per-class validation Dice:
-  - GAN injection starts at epoch 0 with a baseline rate (15%).
+  - GAN injection starts at epoch 0 with a baseline rate (30%).
   - Per-class Dice is smoothed via EMA (alpha=0.1) to filter patch-level noise.
   - When a class's smoothed Dice plateaus over a 50-epoch lookback, its GAN
     injection rate increases and its label generation threshold decreases
@@ -12,6 +12,7 @@ Schedule adapts to per-class validation Dice:
     so the schedule survives wall-time restarts.
 """
 
+import json
 import os
 import numpy as np
 import torch
@@ -49,9 +50,9 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
         super().__init__(*args, **kwargs)
 
         # --- Adaptive schedule parameters ---
-        self.gan_base_prob = 0.15
+        self.gan_base_prob = 0.30
         self.gan_max_prob = 0.50
-        self.gan_max_prob_netc = 0.60
+        self.gan_max_prob_netc = 0.85
         self.gan_ramp_step = 0.05
         self.gan_decay_step = 0.03
 
@@ -72,6 +73,12 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
 
         # Per-class Dice from this epoch (set in finish_online_evaluation)
         self._current_epoch_class_dice = None
+
+        # Live tuning: drop a JSON file to adjust ceilings without restarting.
+        # File: ~/bmds260/curgan_tune.json
+        # Example: {"gan_max_prob_netc": 0.85, "gan_max_prob": 0.60}
+        # Checked once per epoch in _adapt_rates. Delete the file to stop overriding.
+        self._tune_file = os.path.expanduser("~/bmds260/curgan_tune.json")
 
         # GliGAN augmenter (lazy loaded)
         self._gligan = None
@@ -166,8 +173,29 @@ class nnUNetTrainerV2_MedNeXt_B_kernel5_CurriculumGAN(nnUNetTrainerV2_MedNeXt_B_
                 (1 - self.ema_alpha) * self.ema_dice[cls_idx])
         self.ema_history[cls_idx].append(self.ema_dice[cls_idx])
 
+    def _read_tune_file(self):
+        """Read live tuning overrides from ~/bmds260/curgan_tune.json if it exists."""
+        try:
+            if os.path.isfile(self._tune_file):
+                with open(self._tune_file) as f:
+                    overrides = json.load(f)
+                changed = False
+                for key in ('gan_max_prob_netc', 'gan_max_prob', 'gan_base_prob',
+                            'gan_ramp_step', 'gan_decay_step'):
+                    if key in overrides and getattr(self, key) != overrides[key]:
+                        old_val = getattr(self, key)
+                        setattr(self, key, overrides[key])
+                        self.print_to_log_file(
+                            f"  TUNE: {key} changed {old_val} -> {overrides[key]}")
+                        changed = True
+                return changed
+        except Exception:
+            pass
+        return False
+
     def _adapt_rates(self):
         """Bidirectional rate adaptation based on smoothed Dice trajectory."""
+        self._read_tune_file()
         for cls_idx in range(4):
             history = self.ema_history[cls_idx]
             if len(history) < self.lookback:

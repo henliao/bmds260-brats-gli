@@ -202,8 +202,11 @@ Postprocessing (connected component removal via `mednextv1_determine_postprocess
 
 | Method | NETC | SNFH | ET | RC |
 |--------|------|------|----|----|
-| Baseline (5-fold ensemble) | TBD | TBD | TBD | TBD |
+| Baseline (5-fold ensemble) | 0.735 +/- 0.299 (n=81) | 0.890 +/- 0.138 (n=162) | 0.782 +/- 0.257 (n=132) | 0.778 +/- 0.301 (n=143) |
 | CurriculumGAN (5-fold ensemble) | TBD | TBD | TBD | TBD |
+| HD Loss (5-fold ensemble) | TBD | TBD | TBD | TBD |
+
+Note: holdout uses 5-fold ensemble inference (softmax averaging across all 5 models). CV uses single-fold-per-case predictions (each case predicted by the one fold that held it out). Holdout numbers are expected to be higher due to the ensemble effect.
 
 ### Comparison with challenge results
 
@@ -213,7 +216,7 @@ All scores are **lesion-wise Dice**. Different evaluation sets are noted.
 |--------|------|------|----|----|----------|--------|
 | **Ours: Baseline MedNeXt-B k5** | 0.656 | 0.867 | 0.755 | 0.771 | Internal CV (5-fold) | This repo |
 | **Ours: CurriculumGAN MedNeXt-B k5** | TBD | TBD | TBD | TBD | Internal CV | This repo |
-| **Ours: Baseline (holdout)** | TBD | TBD | TBD | TBD | Holdout (162 cases) | This repo |
+| **Ours: Baseline (holdout)** | 0.735 | 0.890 | 0.782 | 0.778 | Holdout (162 cases) | This repo |
 | **Ours: CurriculumGAN (holdout)** | TBD | TBD | TBD | TBD | Holdout (162 cases) | This repo |
 | 2025 Winner: nnU-Net baseline | 0.821 | 0.818 | 0.812 | 0.894 | Internal test | [Jia et al. 2025](https://arxiv.org/abs/2509.24973) |
 | 2025 Winner: Regular on-the-fly GAN | 0.824 | 0.815 | 0.813 | 0.883 | Internal test | [Jia et al. 2025](https://arxiv.org/abs/2509.24973) |
@@ -235,11 +238,11 @@ All scores are **lesion-wise Dice**. Different evaluation sets are noted.
 Performance-adaptive on-the-fly GliGAN tumor injection for MedNeXt-B training. Pretrained GliGAN generators synthesize realistic tumors and inject them into healthy brain regions during training. Unlike fixed-schedule approaches, the injection probability and label generation both adapt per-class based on EMA-smoothed validation Dice trajectories. See [docs/METHOD.md](docs/METHOD.md) for full design rationale.
 
 **Adaptive schedule:**
-- GAN injection starts at epoch 0 with a baseline rate (15%) for all classes.
+- GAN injection starts at epoch 0 with a baseline rate (30%) for all classes.
 - Per-class online validation Dice is smoothed via EMA (alpha=0.1) and tracked over a 50-epoch lookback window.
 - When a class plateaus (EMA improvement below threshold), its GAN injection rate increases (+0.05 per detection). When it improves again, the rate decays back toward baseline (-0.03). Bidirectional, not ratchet-only.
-- NETC has a lower plateau threshold (0.005 vs 0.01) and higher max rate (60% vs 50%).
-- **Class-weighted label generation:** per-class binarization thresholds on the label GAN output are modulated by the current injection rate. At baseline (0.15): threshold 0.5 (normal). At max NETC rate (0.60): threshold -0.2 (~3x larger NETC region). This directly controls how much of each class appears in synthetic tumors without rejection sampling.
+- NETC has a lower plateau threshold (0.005 vs 0.01) and higher max rate (85% in code, 95% via live tune file, vs 50% for other classes).
+- **Class-weighted label generation:** per-class binarization thresholds on the label GAN output are modulated by the current injection rate. At baseline (0.30): threshold 0.5 (normal). At max NETC rate: threshold approaches -0.2 (~3x larger NETC region). This directly controls how much of each class appears in synthetic tumors without rejection sampling.
 - **Anatomical enforcement:** labels are cleaned to remove class voxels outside the dilated whole-tumor boundary and tiny isolated components (<5 voxels).
 - **Checkpoint persistence:** adaptive state (EMA history, per-class rates) survives 48h wall-time restarts.
 
@@ -310,6 +313,25 @@ for f in ~/bmds260/logs/curgan_*.out; do
   echo
 done
 ```
+
+#### Log backups
+
+Training logs are backed up every 5 minutes via `rsync --append` to `~/bmds260/log_backups/`. This preserves the full epoch-by-epoch history (Dice EMA, GAN probs, label thresholds) across 48h wall-time restarts. On resume, nnU-Net creates a new log file with a fresh timestamp; the backup script captures both files per fold.
+
+The backup runs in a tmux session on the rice login node:
+
+```bash
+# Check if running
+tmux list-sessions | grep logsync
+
+# Restart if needed
+tmux new-session -d -s logsync "bash ~/bmds260/sync_logs.sh"
+
+# View backup status
+ls -lh ~/bmds260/log_backups/
+```
+
+The backup script (`sync_logs.sh`) uses `rsync --append` so it only copies new bytes, never truncates existing backup data. Logs contain all data needed to reconstruct per-epoch GAN rate and Dice curves for the report.
 
 For baseline (non-GAN) training, the training log is in the nnU-Net results directory:
 
