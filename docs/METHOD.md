@@ -26,6 +26,22 @@ GliGAN (Ferreira et al. 2024) generates realistic synthetic brain tumors by:
 
 This directly increases training diversity for rare classes. The 2024 and 2025 BraTS challenge winners both used GliGAN augmentation.
 
+### Why nnU-Net uses fixed augmentation (and why that's insufficient)
+
+nnU-Net applies heavy geometric and intensity augmentation (rotation, scaling, elastic deformation, gamma correction, mirroring) at fixed probabilities from epoch 0 through 1000. There is no feedback loop and no performance-based adjustment. The only scheduled parameter is the learning rate (polynomial decay: `(1 - epoch/max_epoch)^0.9`), which is also fixed at init.
+
+This is a deliberate design choice. nnU-Net's philosophy is "no tuning required": architecture, preprocessing, and training are determined by dataset fingerprinting. Fixed augmentation rates that work well across 23+ medical segmentation datasets eliminate one more thing to tune. Isensee et al. (2021) showed that removing augmentation early in training hurts final performance, supporting the "heavy augmentation from epoch 0" strategy.
+
+Dynamic augmentation is not inherently problematic, but it has limited adoption in medical segmentation for practical reasons:
+
+- **AutoAugment/RandAugment (Cubuk et al. 2019)**: Learned augmentation policies showed gains on CIFAR/ImageNet, but search cost was enormous. The community settled on RandAugment (random magnitude, fixed probability) because it worked nearly as well with zero search overhead.
+
+- **ADA (Karras et al. 2020)**: Adapts augmentation for GAN discriminator training using a single global heuristic. Not applied to downstream segmentation training.
+
+- **No prior work adapts augmentation per-class based on validation Dice.** The mechanism we propose is novel in this specific form.
+
+The core limitation of fixed augmentation for BraTS is that it cannot account for per-class learning dynamics. NETC learns differently from ET/SNFH/RC: sparser, more variable, more sensitive to the ratio of real vs. synthetic data at different training phases. A fixed 60% GAN rate (Jain et al. 2025) may be optimal for ET but harmful for NETC at certain epochs, or vice versa. Our per-class adaptive control addresses this.
+
 ### Why adaptive scheduling
 
 Prior work uses fixed GAN injection rates for all 1000 epochs. This has three problems:
@@ -207,6 +223,23 @@ Most classes plateauing as learning rate approaches minimum. GAN rates at or nea
 All experiments use the same 5-fold cross-validation split (1459 cases, 292 per fold) and holdout set (162 cases). Lesion-wise Dice is the primary metric (BraTS 2024 challenge standard).
 
 Experiment B (HD boundary loss) tests whether a boundary-aware loss function (Kervadec et al. 2019) improves segmentation of small, boundary-critical regions like NETC without any synthetic data. It uses signed distance transforms from ground truth labels to penalize predictions that are geometrically far from the true boundary, staged late in training (epoch 800+) to avoid destabilizing early convergence.
+
+### Evaluation metric: BraTS 2024 lesion-wise Dice
+
+We use the official BraTS 2024 lesion-wise Dice evaluation ([rachitsaluja/BraTS-2024-Metrics](https://github.com/rachitsaluja/BraTS-2024-Metrics), `metrics_GLI.py`). Key parameters:
+
+| Label | Dilation Factor | Volume Threshold (voxels) |
+|-------|-----------------|---------------------------|
+| NETC | 5 | 20 |
+| SNFH | 5 | 20 |
+| ET | 3 | 10 |
+| RC | 5 | 20 |
+
+Dilation merges nearby connected components to avoid over-counting fragmented predictions as separate lesions. Volume thresholds filter small predicted components that are likely noise. ET gets a lower dilation factor and volume threshold because its morphology (thin, irregular rims around tumor core) produces genuinely small fragments that are clinically meaningful, whereas NETC/SNFH/RC form bulkier masses where sub-20-voxel components are more likely segmentation artifacts.
+
+Note: these per-label parameters are new in 2024. BraTS 2023 used global parameters (`dilation_factor=3`, `volume_thresh=50` for all labels). BraTS 2025 evaluation metrics are not yet finalized. The specific threshold values are set by the challenge organizers; no published derivation or sensitivity analysis exists. Also note that NETC's difficulty is driven by prevalence (absent in ~55% of cases) and heterogeneity, not physical lesion size. NETC gets the same threshold as SNFH/RC because when present, its lesions form cohesive blobs of comparable volume.
+
+FP penalty: any predicted lesion with no matching ground truth component receives DSC=0 and HD95=374mm. FN penalty: any ground truth lesion with no matching prediction similarly receives DSC=0 and HD95=374mm.
 
 ## Literature context
 
