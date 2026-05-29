@@ -346,6 +346,51 @@ The closest existing work is ADA (Karras et al. 2020), which adapts augmentation
 
 10. **Threshold modulation changes tumor anatomy.** Lowering the NETC threshold from 0.5 to -0.2 roughly triples the NETC region. At aggressive thresholds, the synthetic NETC region may become unrealistically large compared to real NETC distributions. The anatomical enforcement step (dilation boundary, minimum component size) prevents gross violations, but subtler distributional shifts in region size could introduce bias. We do not quantitatively measure synthetic vs. real NETC size distributions.
 
+## The precision-recall framing: why NETC is hard and how each experiment addresses it
+
+### NETC as a recall problem
+
+NETC underperformance is primarily a recall problem. The baseline model learns that most scans don't contain NETC (absent in ~55% of cases) and that when present, NETC occupies a tiny fraction of voxels. The safe prediction is "little or no NETC." This yields high precision (when the model predicts NETC, it's usually correct) but low recall (it misses real NETC regions, especially small or subtle ones).
+
+Dice captures both errors in a single number: `2*TP / (2*TP + FP + FN)`. A model that never predicts NETC has TP=0, FP=0, FN=all, giving Dice=0. A model that predicts NETC everywhere has high FN reduction but massive FP, also giving low Dice. The optimal Dice balances precision and recall, but the baseline is far to the precision side of that balance.
+
+### How each experiment attacks this
+
+**Experiment A (Baseline, Dice+CE):** Treats all classes equally. The Dice loss penalizes FP and FN symmetrically. For NETC, this produces a precision-biased model because the class prior (55% absent, small when present) makes FN cheap relative to FP in terms of loss magnitude. The model learns to be conservative.
+
+**Experiment B (HD Boundary Loss):** Adds a boundary-aware loss term (Kervadec et al. 2019) after epoch 800. Signed distance maps from ground truth penalize predictions proportional to their geometric distance from true boundaries. This targets a specific failure mode: predictions that are roughly right in location but wrong at the boundary. It does not directly address the recall problem (completely missed NETC regions get no boundary signal, because there's no predicted region to penalize). HD loss primarily improves precision of existing predictions rather than recall of missed regions.
+
+**Experiment C (CurriculumGAN):** Directly addresses recall by showing the model more NETC examples via synthetic injection. At 30-95% injection rates, NETC appears in nearly every training batch, shifting the model's learned prior from "NETC is rare" to "NETC is common." This improves recall (model learns to detect NETC features it would otherwise ignore) but risks overcorrecting: at 95% GAN rate, the model may hallucinate NETC in scans where it doesn't exist, degrading precision.
+
+The adaptive mechanism searches for the injection rate where the recall gain outweighs the precision cost, as measured by Dice (which penalizes both). The observed training dynamics confirm this: when GAN rate pins at 0.95, NETC EMA drops (precision loss exceeds recall gain); when the rate decays toward 0.30-0.50, EMA recovers (better balance).
+
+### What "distortion" looks like at high GAN rates
+
+When the GAN injection rate is pinned at 0.95, the training distribution diverges from the real distribution. Concretely:
+
+1. **Hallucinated components.** The model predicts small NETC blobs in regions that are healthy tissue or a different tumor subregion. Under BraTS 2024 lesion-wise Dice, each unmatched predicted component receives DSC=0, directly penalizing the fold average.
+
+2. **Boundary bleeding.** Real NETC regions get over-segmented, with the predicted mask extending into adjacent SNFH or edema. The per-voxel Dice denominator grows without proportional numerator (TP) increase.
+
+3. **Class confusion at ambiguous voxels.** At tumor boundaries where NETC transitions to SNFH or ET, the model's softmax outputs shift toward NETC. Voxels that should be SNFH are classified as NETC. This hurts NETC precision (FP) and SNFH recall (FN for SNFH), though in practice SNFH remains stable (0.92-0.93) because the misclassified voxels are a small fraction of the large SNFH volume.
+
+The EMA captures this indirectly: raw validation Dice drops when the prediction mask is "too generous" for NETC. However, a Dice drop from an over-generous mask only tells us that FP growth outweighs any FN reduction. It does not decompose the magnitudes. Comparing TP/FP/FN counts or lesion-wise component counts at GAN=0.30 vs GAN=0.95 checkpoints on the same fold would provide direct evidence, and is a potential analysis for the final report.
+
+### Why not Tversky loss instead of Dice?
+
+Tversky loss generalizes Dice with separate FP/FN weights: `TP / (TP + alpha*FP + beta*FN)`. At alpha=beta=0.5, Tversky = Dice. Setting beta > 0.5 penalizes FN more heavily, directly pushing the model toward higher recall for underperforming classes like NETC.
+
+In principle, Tversky could address NETC recall more cleanly than CurriculumGAN, because it operates at the loss level rather than the data distribution level. There is no risk of distribution mismatch or hallucinated components from augmentation. The tradeoff is explicit and tunable via alpha/beta.
+
+In practice, Tversky has limited adoption among top BraTS submissions. The 2024 and 2025 winners (Jain et al.) used Dice+CE, as does nnU-Net. The empirical finding is that Dice+CE is hard to beat, and Tversky's alpha/beta hyperparameters introduce sensitivity: too high a beta causes FP explosions, and the optimal setting varies per dataset, per class, and potentially per training stage.
+
+CurriculumGAN and Tversky attack the same problem from different angles:
+- **CurriculumGAN:** Changes the data distribution to shift the model's learned class prior (more NETC in training = model learns NETC is less rare). The loss stays symmetric (Dice+CE).
+- **Tversky:** Changes the loss to penalize FN more than FP. The data distribution stays unchanged.
+- **Combined (future work):** Adaptive per-class Tversky (adjusting beta online based on per-class validation Dice) with CurriculumGAN augmentation could address both the data and loss sides simultaneously. This is unexplored.
+
+The training loss and evaluation metric are independent. A model trained with Tversky is still evaluated by BraTS 2024 lesion-wise Dice. There is no requirement that they match.
+
 ### Recommendations for paper framing
 
 - Frame the contribution as **"adaptive augmentation scheduling"**, not as a new GAN or a new architecture. The novelty is in the control loop, not the components.
@@ -353,3 +398,85 @@ The closest existing work is ADA (Karras et al. 2020), which adapts augmentation
 - Position the live tuning mechanism as a practical engineering contribution for HPC training, not as part of the core method.
 - If NETC Dice improves meaningfully (>0.02 over baseline), highlight the bidirectional mechanism as the key differentiator vs. simply running GliGAN at a higher fixed rate.
 - If results are modest or mixed, frame as: "adaptive scheduling concentrates augmentation where needed, but the noisy online Dice signal limits the precision of the adaptation."
+- Frame the three experiments as complementary approaches to the precision-recall tradeoff for rare classes: baseline (symmetric loss, no augmentation = precision-biased), HD loss (boundary refinement = precision improvement), CurriculumGAN (data distribution shift = recall improvement). This positions the work as a systematic exploration, not a single-method paper.
+- Note that Tversky loss is a natural extension (loss-level recall targeting) that could complement the data-level approach. Cite Focal Tversky Loss (Abraham & Khan, 2019) and note it is underrepresented in BraTS submissions despite theoretical appeal.
+
+## Future work: fixing the plateau detection asymmetry
+
+### The core problem
+
+The current plateau detector has one condition: `improvement < plateau_threshold`. This fires on both genuinely flat EMA (true plateau) and actively declining EMA (over-augmentation damage). The system cannot distinguish "model has stopped learning" from "model is being harmed by too much synthetic data." Both look the same to the detector, and both trigger a GAN rate increase, which is the correct response for the first case and the opposite of what's needed for the second.
+
+The decay path requires `improvement > improvement_threshold` (positive delta), so it only fires during recovery. This creates a feedback loop: over-augmentation causes decline, decline triggers ramp, ramp worsens over-augmentation. The loop is bounded (the model eventually adapts and recovers, producing a positive delta that triggers decay), but it costs ~50 epochs of suboptimal training per cycle. Observed in folds 1, 2, and 3.
+
+### The fix: directional adaptation
+
+Replace the single plateau condition with sign-aware logic:
+
+```
+delta = ema_dice[now] - ema_dice[now - lookback]
+
+if delta < -decline_threshold:    # falling: REDUCE augmentation
+    new_rate = max(rate - decay_step, base_rate)
+elif delta < plateau_threshold:   # flat: INCREASE augmentation
+    new_rate = min(rate + ramp_step, max_rate)
+elif delta > improvement_threshold:  # improving: REDUCE augmentation
+    new_rate = max(rate - decay_step, base_rate)
+else:                              # moderate improvement: hold
+    new_rate = rate
+```
+
+This is a one-line conceptual change (split the below-threshold case by sign), but it fundamentally changes the system's behavior under over-augmentation: instead of holding at the ceiling while EMA drops, the system immediately begins reducing the GAN rate.
+
+### Why this was not implemented
+
+The asymmetry was discovered mid-training (around epoch 400 of fold 2) after folds were already running. Changing the adaptation logic mid-experiment would invalidate the ablation. The fix requires a separate 5-fold experiment to evaluate properly, and compute budget did not allow a fourth experiment arm.
+
+### Why EMA is the right feedback signal (not batch frequency or gradient norms)
+
+Alternative feedback signals were considered:
+
+1. **Batch-level class frequency** (how often NETC appears in training batches): roughly constant for a given dataset. NETC prevalence doesn't change during training. The problem is not that NETC disappears from batches, it's that the model stops learning from it effectively despite seeing it. Two models can see identical NETC frequency but have very different NETC Dice because one is in a productive learning phase and the other has saturated.
+
+2. **Per-class gradient magnitude** (gradient norm through the NETC output head): a leading indicator (visible before Dice drops), but noisy and difficult to threshold. What gradient norm constitutes "giving up" on a class? The answer depends on learning rate, batch composition, and training phase. No principled threshold exists without empirical calibration per dataset.
+
+3. **Prediction entropy on NETC voxels**: measurable per-batch (faster feedback), but entropy conflates uncertainty-from-learning (good, model is still exploring) with uncertainty-from-confusion (bad, model can't distinguish classes). A model early in training and a model being harmed by over-augmentation can have similar entropy profiles.
+
+4. **Per-class calibration error**: more sensitive than Dice to early degradation, but requires a calibration set and adds computational overhead at each evaluation.
+
+EMA-smoothed validation Dice is the right signal because it directly measures the quantity we care about: is the model getting better at segmenting this class? The lag is the cost of measuring the right thing (actual performance) versus measuring a proxy (exposure, gradients, entropy). The proxies are faster but less directly tied to the adaptation decision.
+
+The real improvement is not a faster signal, but a smarter response to the existing signal: the directional fix above eliminates the ~50-epoch correction cycles while keeping the EMA feedback that correctly captures learning dynamics.
+
+## Evaluation: per-case variance and failure rate analysis
+
+The primary evaluation metric is holdout lesion-wise Dice (BraTS 2024 protocol, 162 cases). Since all 5 fold models are ensembled into a single prediction per case (softmax averaging), the reportable variance is per-case, not per-fold.
+
+For each label (NETC, SNFH, ET, RC) and each experiment (baseline, CurriculumGAN, HD loss), the paper should report:
+
+1. **Mean Dice** (headline number, standard for BraTS comparisons)
+2. **Standard deviation** (per-case spread, measures consistency)
+3. **Median Dice** (robust to outliers: a few catastrophic failures can drag the mean down while the model performs well on most cases)
+4. **Failure rate**: percentage of cases with Dice below a clinically meaningful threshold (e.g., < 0.1 for NETC). This directly captures clinical reliability: how often does the model produce a useless segmentation?
+5. **Interquartile range (IQR)**: distribution shape beyond mean/std
+
+The key hypothesis for CurriculumGAN is not just higher mean NETC Dice, but reduced per-case variance and lower failure rate. If CurriculumGAN concentrates synthetic augmentation on underperforming classes, we expect the lower tail of the NETC Dice distribution to improve: fewer cases where the model completely misses the non-enhancing core. This is arguably more clinically valuable than a marginal increase in mean Dice.
+
+Visualization: per-case Dice distributions as box plots or violin plots (baseline vs CurriculumGAN vs HD loss), with failure rate thresholds marked. Paired analysis (same 162 cases across experiments) enables per-case delta analysis and Wilcoxon signed-rank tests for statistical significance.
+
+### Mean Dice vs variance: no guaranteed correlation
+
+A higher-variance model can have a higher mean Dice. These two quantities are not inherently correlated, and the relationship depends on where the improvement comes from.
+
+**Scenario A (high variance, high mean):** CurriculumGAN dramatically improves performance on cases where the synthetic GAN tumors match the test morphology, but degrades or doesn't help cases with unusual morphology the GAN can't replicate. The result is higher mean (gains on "easy" cases outweigh losses on "hard" cases) but also higher variance (wider spread between best and worst cases). This is a plausible failure mode for GAN augmentation: the model becomes more specialized rather than more robust.
+
+**Scenario B (low variance, high mean):** The more desirable outcome. Improvement is concentrated in the lower tail of the distribution: the cases where baseline scores 0.0-0.3 get pulled up, while cases already at 0.8+ stay roughly the same. This mechanically raises the mean while reducing variance. Cases at the top have little room to improve, so gains must come from fixing failures.
+
+**Scenario C (low variance, lower mean):** A model that performs uniformly but modestly. Not competitive on the leaderboard but potentially more reliable in deployment.
+
+For our analysis, the per-case paired delta (CurriculumGAN Dice minus baseline Dice on each of the 162 holdout cases) is the critical diagnostic. The distribution of deltas reveals which scenario applies:
+- Deltas concentrated in cases where baseline was low (Scenario B): the clean narrative, adaptive augmentation rescues hard cases
+- Deltas positive across all cases uniformly: general improvement, less interesting mechanistically
+- Deltas positive on some cases but negative on others (Scenario A): a red flag. The model traded consistency for aggregate performance. This must be disclosed and investigated, not hidden behind a mean.
+
+The BraTS challenge leaderboard only ranks by mean lesion-wise Dice per label. It does not consider variance, median, failure rate, or distribution shape. But for a paper evaluating a new training strategy, the full distributional analysis is expected. Reporting only the mean would be incomplete: it cannot distinguish a uniformly good model from one that is brilliant on half the cases and useless on the other half.

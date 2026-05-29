@@ -2,19 +2,48 @@
 
 Shared tooling for the [BraTS 2024 Post-Treatment Glioma Segmentation Challenge](https://www.synapse.org/Synapse:syn53708249):
 
-- **eval_lesion_dice.py** -- Official lesion-wise Dice evaluation, reimplemented from the [challenge metrics](https://github.com/rachitsaluja/BraTS-2024-Metrics)
+- **eval_lesion_dice.py** -- Official BraTS 2024 evaluation: lesion-wise Dice, lesion-wise HD95, legacy (voxel) Dice, legacy HD95. Reimplemented from the [challenge metrics](https://github.com/rachitsaluja/BraTS-2024-Metrics)
 - **setup_brats_nnunet.sh** -- Convert BraTS-GLI data to nnU-Net v1 format (symlinks)
 - **train_mednext_v2.slurm** -- SLURM script for MedNeXt-B (kernel 5x5x5) training on FarmShare
 - **prep_holdout.sh** -- Prepare holdout test set for inference and evaluation
 
 ## What this computes
 
-The BraTS 2024 challenge uses **lesion-wise Dice**, not voxel-wise Dice. Key differences:
+### Metrics
+
+| Metric | CLI flag | Description |
+|--------|----------|-------------|
+| **Lesion-wise Dice** | `lw-dice` | BraTS 2024 primary metric. Per-lesion matching with FP penalty. |
+| **Lesion-wise HD95** | `lw-hd95` | 95th percentile Hausdorff distance per matched lesion. Unmatched FPs penalized at 337mm. |
+| **Legacy Dice** | `legacy-dice` | Standard voxel-level Dice (2*TP / (FP+FN+2*TP)). |
+| **Legacy HD95** | `legacy-hd95` | Standard voxel-level 95th percentile Hausdorff distance. |
+
+### Regions
+
+| Region | Labels | Description |
+|--------|--------|-------------|
+| **NETC** | 1 | Non-enhancing tumor core |
+| **SNFH** | 2 | Surrounding non-enhancing FLAIR hyperintensity |
+| **ET** | 3 | Enhancing tumor |
+| **RC** | 4 | Resection cavity |
+| **TC** | 1+3 | Tumor Core (NETC + ET) |
+| **WT** | 1+2+3 | Whole Tumor (NETC + SNFH + ET). Does **not** include RC. |
+
+### Lesion-wise evaluation details
 
 1. **Dilation before connected component analysis** -- nearby blobs within a few voxels are merged into a single lesion (5 iterations for NETC/SNFH/RC, 3 for ET)
 2. **Volume thresholding** -- GT lesions <= 20 voxels are excluded from false negative counting; predicted lesions <= 20 voxels are removed entirely (10 for ET)
 3. **False positive penalty** -- unmatched predicted lesions appear in the denominator: `sum(dice_per_gt_lesion) / (n_gt_lesions + n_fp_lesions)`
-4. **Per-label evaluation** -- scores are computed separately for NETC (label 1), SNFH (label 2), ET (label 3), RC (label 4)
+4. **HD95 FP penalty** -- unmatched predicted lesions receive 337mm HD95 penalty (BraTS 2024 official)
+5. **Per-region evaluation** -- scores are computed separately for each requested region
+
+### HD95 implementation
+
+HD95 is computed using scipy's Euclidean Distance Transform (EDT), with no external `surface-distance` dependency:
+1. Surface voxels extracted via `binary_erosion` XOR original mask
+2. `distance_transform_edt` with voxel spacing computes distance from each surface voxel to the nearest voxel of the opposing mask
+3. Bidirectional distances concatenated, 95th percentile returned
+4. If either mask is empty, returns 337mm (FP penalty)
 
 ## Setup
 
@@ -36,7 +65,7 @@ pip install connected-components-3d nibabel scipy numpy
 
 ## Usage
 
-### Generic (any framework)
+### Basic (all metrics, all regions)
 
 ```bash
 python3 eval_lesion_dice.py \
@@ -45,17 +74,69 @@ python3 eval_lesion_dice.py \
   -o results.json
 ```
 
-**pred-dir**: directory containing predicted segmentation NIfTI files (`.nii.gz`). Each file is a 3D volume with integer labels 0-4.
+This computes all 4 metrics for all 6 regions (NETC, SNFH, ET, RC, TC, WT).
 
-**gt-dir**: directory containing ground truth segmentation NIfTI files (`.nii.gz`). Same format. Filenames must match prediction filenames exactly.
+### Selecting specific metrics
+
+```bash
+# Lesion-wise Dice only (fastest, v1 behavior)
+python3 eval_lesion_dice.py \
+  --pred-dir /path/to/predictions \
+  --gt-dir /path/to/ground_truth \
+  --metrics lw-dice \
+  -o results.json
+
+# Lesion-wise Dice + HD95
+python3 eval_lesion_dice.py \
+  --pred-dir /path/to/predictions \
+  --gt-dir /path/to/ground_truth \
+  --metrics lw-dice lw-hd95 \
+  -o results.json
+
+# Legacy (voxel-level) only
+python3 eval_lesion_dice.py \
+  --pred-dir /path/to/predictions \
+  --gt-dir /path/to/ground_truth \
+  --metrics legacy-dice legacy-hd95 \
+  -o results.json
+```
+
+### Selecting specific regions
+
+```bash
+# Individual labels only (v1 behavior)
+python3 eval_lesion_dice.py \
+  --pred-dir /path/to/predictions \
+  --gt-dir /path/to/ground_truth \
+  --regions NETC SNFH ET RC \
+  -o results.json
+
+# Composite regions only
+python3 eval_lesion_dice.py \
+  --pred-dir /path/to/predictions \
+  --gt-dir /path/to/ground_truth \
+  --regions TC WT \
+  -o results.json
+
+# Mix and match
+python3 eval_lesion_dice.py \
+  --pred-dir /path/to/predictions \
+  --gt-dir /path/to/ground_truth \
+  --metrics lw-dice lw-hd95 \
+  --regions NETC ET TC WT \
+  -o results.json
+```
 
 ### nnU-Net shortcut
 
 If you trained with nnU-Net, the script can find predictions and ground truth automatically:
 
 ```bash
-# MedNeXt on Task501, fold 0
+# MedNeXt on Task501, fold 0 (all metrics, all regions)
 python3 eval_lesion_dice.py --task 501 --fold 0
+
+# With specific metrics/regions
+python3 eval_lesion_dice.py --task 501 --fold 0 --metrics lw-dice --regions NETC SNFH ET RC
 
 # Different trainer
 python3 eval_lesion_dice.py --task 501 --fold 0 --trainer nnUNetTrainerV2__nnUNetPlansv2.1
@@ -123,7 +204,11 @@ EOF
 sbatch eval_job.sh
 ```
 
-Processing time: ~1-2 minutes per case (270 cases takes ~45 min on a compute node).
+Processing time per case:
+- `--metrics lw-dice` only: ~1-2 min/case
+- `--metrics lw-dice lw-hd95`: ~2-3 min/case (EDT adds overhead)
+- All metrics: ~3-4 min/case
+- 162-case holdout, all metrics: ~6-8 hours on a compute node
 
 ## Output format
 
@@ -131,25 +216,37 @@ Processing time: ~1-2 minutes per case (270 cases takes ~45 min on a compute nod
 {
   "pred_dir": "/path/to/predictions",
   "gt_dir": "/path/to/ground_truth",
+  "metrics": ["lw-dice", "lw-hd95", "legacy-dice", "legacy-hd95"],
+  "regions": ["NETC", "SNFH", "ET", "RC", "TC", "WT"],
   "summary": {
-    "NETC": {"mean": 0.4680, "std": 0.3587, "median": 0.5774, "n_cases": 127},
-    "SNFH": {"mean": 0.8736, "std": 0.1224, "median": 0.9006, "n_cases": 270},
-    "ET":   {"mean": 0.8029, "std": 0.1855, "median": 0.8966, "n_cases": 200},
-    "RC":   {"mean": 0.7233, "std": 0.2969, "median": 0.8523, "n_cases": 248}
+    "NETC": {
+      "lw_dice":    {"mean": 0.7377, "std": 0.2947, "median": 0.8706, "n_cases": 82},
+      "lw_hd95":    {"mean": 12.34,  "std": 25.67,  "median": 2.45,   "n_cases": 82},
+      "legacy_dice": {"mean": 0.7604, "std": 0.2631, "median": 0.8500, "n_cases": 82},
+      "legacy_hd95": {"mean": 10.21,  "std": 22.33,  "median": 1.89,   "n_cases": 82}
+    },
+    "TC": {
+      "lw_dice":    {"mean": 0.7912, "std": 0.2687, "median": 0.8900, "n_cases": 133},
+      "legacy_dice": {"mean": 0.8342, "std": 0.2322, "median": 0.9100, "n_cases": 133}
+    },
+    "WT": {
+      "lw_dice":    {"mean": 0.9097, "std": 0.1175, "median": 0.9500, "n_cases": 162},
+      "legacy_dice": {"mean": 0.9437, "std": 0.0414, "median": 0.9600, "n_cases": 162}
+    }
   },
   "per_case": [
     {
-      "case": "BRATS_0010",
-      "NETC": {"dice": 0.5774, "n_gt": 1, "n_pred": 1, "tp": 1, "fp": 0, "fn": 0},
-      "SNFH": {"dice": 0.9092, "n_gt": 1, "n_pred": 1, "tp": 1, "fp": 0, "fn": 0},
-      "ET": {"dice": 0.9133, "n_gt": 1, "n_pred": 1, "tp": 1, "fp": 0, "fn": 0},
-      "RC": {"dice": 0.8523, "n_gt": 1, "n_pred": 1, "tp": 1, "fp": 0, "fn": 0}
+      "case": "HOLDOUT_0001",
+      "NETC": {"lw_dice": 0.8706, "lw_hd95": 1.23, "legacy_dice": 0.8500, "legacy_hd95": 1.05, "n_gt": 1, "n_pred": 1, "tp": 1, "fp": 0, "fn": 0},
+      "SNFH": {"lw_dice": 0.9328, "legacy_dice": 0.9450, ...},
+      "TC": {"lw_dice": 0.8900, "legacy_dice": 0.9100, ...},
+      "WT": {"lw_dice": 0.9500, "legacy_dice": 0.9600, ...}
     }
   ]
 }
 ```
 
-Labels where both GT and prediction are empty are marked `"absent"` and excluded from averages.
+Regions where both GT and prediction are empty are marked `"absent"` and excluded from averages.
 
 ## Label mapping
 
@@ -160,6 +257,8 @@ Labels where both GT and prediction are empty are marked `"absent"` and excluded
 | 2 | SNFH | Surrounding non-enhancing FLAIR hyperintensity |
 | 3 | ET | Enhancing tumor |
 | 4 | RC | Resection cavity |
+| -- | TC | Tumor Core = labels 1+3 (NETC + ET) |
+| -- | WT | Whole Tumor = labels 1+2+3 (NETC + SNFH + ET) |
 
 ## Results
 
@@ -356,15 +455,23 @@ export nnUNet_raw_data_base=~/bmds260/nnunet/raw_data_base
 export nnUNet_preprocessed=~/bmds260/nnunet/preprocessed
 export RESULTS_FOLDER=~/bmds260/nnunet/results
 
-nnUNetv2_predict \
+mednextv1_predict \
   -i $nnUNet_raw_data_base/nnUNet_raw_data/Task501_BraTSGLI_v2/imagesTs \
   -o ~/bmds260/holdout_predictions \
   -tr nnUNetTrainerV2_MedNeXt_B_kernel5 \
   -t 501 -m 3d_fullres -f 0 1 2 3 4
 
-# Evaluate
+# Evaluate (all metrics, all regions)
 python3 eval_lesion_dice.py \
   --pred-dir ~/bmds260/holdout_predictions \
   --gt-dir ~/bmds260/holdout_gt \
-  -o holdout_lesion_dice.json
+  -o holdout_eval.json
+
+# Evaluate (lesion-wise Dice only, individual labels only, v1 behavior)
+python3 eval_lesion_dice.py \
+  --pred-dir ~/bmds260/holdout_predictions \
+  --gt-dir ~/bmds260/holdout_gt \
+  --metrics lw-dice \
+  --regions NETC SNFH ET RC \
+  -o holdout_lw_dice.json
 ```
