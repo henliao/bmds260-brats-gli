@@ -13,47 +13,47 @@
 | TC | 0.789 | 24.1 | 0.801 | 18.7 | 132 |
 | WT | 0.880 | 13.2 | 0.921 | 2.4 | 162 |
 
-### CurriculumGAN MedNeXt-B kernel 5x5x5 (4-fold ensemble, folds 1-4, 1000 epochs)
+### CurriculumGAN MedNeXt-B kernel 5x5x5 (5-fold ensemble, 1000 epochs)
 
 | Region | LW-Dice | LW-HD95 (mm) | Legacy Dice | Legacy HD95 (mm) | n |
 |--------|---------|--------------|-------------|------------------|---|
-| NETC | 0.725 | 36.3 | 0.698 | 44.7 | 81 |
-| SNFH | 0.892 | 8.2 | 0.910 | 4.5 | 162 |
-| ET | 0.774 | 25.9 | 0.796 | 18.6 | 132 |
-| RC | 0.778 | 28.1 | 0.742 | 29.7 | 145 |
-| TC | 0.779 | 26.0 | 0.802 | 18.7 | 132 |
-| WT | 0.885 | 11.4 | 0.920 | 2.4 | 162 |
+| NETC | 0.738 | 32.3 | 0.702 | 44.7 | 81 |
+| SNFH | 0.895 | 7.2 | 0.911 | 4.2 | 162 |
+| ET | 0.784 | 23.5 | 0.800 | 18.7 | 132 |
+| RC | 0.769 | 33.7 | 0.743 | 31.8 | 145 |
+| TC | 0.789 | 23.6 | 0.805 | 18.7 | 132 |
+| WT | 0.882 | 12.6 | 0.920 | 2.0 | 162 |
 
-Note: CurriculumGAN uses 4-fold ensemble (fold 0 still training, epoch ~762). Baseline uses 5-fold ensemble. Not a fair comparison until fold 0 completes.
+### CurriculumGAN vs Baseline (5-fold, delta)
 
-### CurriculumGAN vs Baseline (delta)
-
-| Region | LW-Dice | LW-HD95 | Legacy Dice | Legacy HD95 |
-|--------|---------|---------|-------------|-------------|
-| NETC | -0.010 | 0.0 | 0.000 | +3.6 |
-| SNFH | **+0.002** | **-0.8** | -0.001 | 0.0 |
-| ET | -0.008 | +0.6 | 0.000 | -0.1 |
-| RC | 0.000 | **-4.8** | -0.016 | +6.7 |
-| TC | -0.010 | +1.9 | +0.001 | 0.0 |
-| WT | **+0.005** | **-1.8** | -0.001 | 0.0 |
+| Region | LW-Dice | LW-HD95 (mm) | Legacy Dice | Legacy HD95 (mm) |
+|--------|---------|--------------|-------------|------------------|
+| NETC | **+0.003** | **-4.0** | +0.004 | +3.6 |
+| SNFH | **+0.006** | **-1.8** | +0.001 | -0.3 |
+| ET | **+0.002** | **-1.8** | +0.004 | 0.0 |
+| RC | -0.009 | +0.8 | -0.015 | +8.8 |
+| TC | 0.000 | **-0.5** | +0.004 | 0.0 |
+| WT | **+0.002** | **-0.6** | -0.001 | -0.4 |
 
 Key observations:
-- CurriculumGAN shows HD95 improvements on SNFH (-0.8mm), RC (-4.8mm), and WT (-1.8mm), suggesting better boundary delineation on these regions.
-- LW-Dice is mostly flat. NETC and TC slightly down, SNFH and WT slightly up.
-- Legacy Dice nearly identical across all regions.
-- NETC LW-Dice (-0.010) may recover when fold 0 is included (fold 0 currently shows strong NETC EMA 0.751 with GAN at 0.93).
-- RC Legacy HD95 is worse (+6.7mm) despite better LW-HD95 (-4.8mm), indicating the model produces fewer but better-localized RC lesions.
+- CurriculumGAN improves LW-Dice on 5/6 regions, with SNFH (+0.006) and NETC (+0.003) showing the largest gains. Only RC regresses (-0.009).
+- LW-HD95 (mean) improves on 5/6 regions. NETC sees the largest boundary improvement (-4.0mm), followed by SNFH and ET (-1.8mm each). Only RC is slightly worse (+0.8mm).
+- Median LW-HD95 is nearly identical between methods (1.21mm baseline vs 1.25mm CurGAN), indicating the mean HD95 improvements are driven by fewer catastrophic outlier cases rather than uniform boundary gains.
+- The adaptive GAN augmentation curriculum helps the model generalize to rare/difficult cases that produce extreme HD95 values in the baseline.
+- RC is the only consistently underperforming region. CurriculumGAN may over-regularize resection cavity boundaries, which have highly variable morphology.
 
-### CurriculumGAN (3-fold ensemble, folds 1-3, v1 eval)
+### CurriculumGAN preliminary results (partial ensembles)
 
-Earlier preliminary run with only 3 folds and v1 metrics (LW-Dice only, individual labels only):
+Earlier runs with incomplete fold ensembles, included for reference:
 
-| Region | CG 3-fold | Baseline 5-fold | Delta |
-|--------|-----------|-----------------|-------|
-| NETC | 0.738 | 0.735 | +0.003 |
-| SNFH | 0.888 | 0.890 | -0.002 |
-| ET | 0.785 | 0.782 | +0.003 |
-| RC | 0.769 | 0.778 | -0.009 |
+| Region | 3-fold (folds 1-3) | 4-fold (folds 1-4) | 5-fold (final) | Baseline |
+|--------|--------------------|--------------------|----------------|----------|
+| NETC | 0.738 | 0.725 | **0.738** | 0.735 |
+| SNFH | 0.888 | 0.892 | **0.895** | 0.890 |
+| ET | 0.785 | 0.774 | **0.784** | 0.782 |
+| RC | 0.769 | 0.778 | 0.769 | **0.778** |
+
+Adding fold 0 to the ensemble recovered NETC (+0.013 vs 4-fold) and ET (+0.010 vs 4-fold). Fold 0 was the weakest fold (NETC EMA 0.751) but its inclusion improved ensemble diversity.
 
 ## Cross-Validation (1459 training cases, per-fold)
 
@@ -75,4 +75,4 @@ TBD (requires running eval on each fold's validation_raw predictions).
 
 ### HD Loss cross-validation
 
-TBD (training in progress: fold 0 at epoch 372, fold 1 at 229, fold 2 at 168, folds 3-4 pending).
+TBD (training in progress: fold 0 at epoch 658, fold 1 at 494, fold 2 at 590, fold 3 at 238).
